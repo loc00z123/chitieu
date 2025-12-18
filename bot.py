@@ -2770,21 +2770,53 @@ def main():
     logger.info("💡 Enterprise Edition - Multi-Line, Charts, Excel Export Enabled")
     logger.info("=" * 60)
     
-    try:
-        application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
-    except Exception as e:
-        error_str = str(e)
-        if "Conflict" in error_str or "getUpdates" in error_str:
-            logger.critical("=" * 60)
-            logger.critical("❌ CRITICAL ERROR: CONFLICT - NHIỀU INSTANCE BOT ĐANG CHẠY!")
-            logger.critical("=" * 60)
-            logger.critical("💡 GIẢI PHÁP:")
-            logger.critical("   1. Dừng TẤT CẢ các terminal đang chạy bot (Ctrl+C)")
-            logger.critical("   2. Chạy lại bot: python bot.py")
-            logger.critical("=" * 60)
-        else:
-            logger.critical(f"❌ Lỗi: {e}")
-        raise
+    # Xử lý conflict với retry logic
+    max_retries = 3
+    retry_delay = 5  # seconds
+    
+    for attempt in range(max_retries):
+        try:
+            # Trước khi start polling, thử dừng các webhook cũ (nếu có)
+            try:
+                bot_instance = application.bot
+                bot_instance.delete_webhook(drop_pending_updates=True)
+                logger.info("🔄 Đã xóa webhook cũ (nếu có)")
+            except Exception as webhook_error:
+                logger.debug(f"Không có webhook cũ để xóa: {webhook_error}")
+            
+            # Start polling
+            logger.info(f"🔄 Đang khởi động polling... (Lần thử {attempt + 1}/{max_retries})")
+            application.run_polling(
+                allowed_updates=Update.ALL_TYPES, 
+                drop_pending_updates=True,
+                close_loop=False
+            )
+            break  # Nếu thành công, thoát khỏi vòng lặp
+            
+        except Exception as e:
+            error_str = str(e)
+            if "Conflict" in error_str or "getUpdates" in error_str:
+                if attempt < max_retries - 1:
+                    logger.warning("=" * 60)
+                    logger.warning(f"⚠️ CONFLICT phát hiện! (Lần thử {attempt + 1}/{max_retries})")
+                    logger.warning("💡 Đang đợi và thử lại...")
+                    logger.warning("=" * 60)
+                    import time
+                    time.sleep(retry_delay)
+                    retry_delay *= 2  # Exponential backoff
+                else:
+                    logger.critical("=" * 60)
+                    logger.critical("❌ CRITICAL ERROR: CONFLICT - NHIỀU INSTANCE BOT ĐANG CHẠY!")
+                    logger.critical("=" * 60)
+                    logger.critical("💡 GIẢI PHÁP:")
+                    logger.critical("   1. Kiểm tra xem có đang chạy bot local không (Ctrl+C để dừng)")
+                    logger.critical("   2. Trên Render: Vào Settings → Restart service")
+                    logger.critical("   3. Đợi 30 giây rồi thử lại")
+                    logger.critical("=" * 60)
+                    raise
+            else:
+                logger.critical(f"❌ Lỗi: {e}")
+                raise
 
 
 if __name__ == '__main__':
