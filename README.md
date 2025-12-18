@@ -1,6 +1,18 @@
 # ExpenseBot - Telegram Bot Quản Lý Chi Tiêu Enterprise Edition
 
-Bot Telegram chuyên nghiệp để quản lý chi tiêu, sử dụng Smart Pattern Matching (không cần AI).
+Bot Telegram chuyên nghiệp để quản lý chi tiêu, sử dụng Smart Pattern Matching + Groq AI + Google Search.
+
+**Copyright (c) 2025 Lộc - All rights reserved.**
+
+## Tính năng mới: Google Search Integration 🔍
+
+Bot giờ đây có thể trả lời các câu hỏi về dữ liệu thực tế:
+- Giá vàng, giá xăng hôm nay
+- Thời tiết các thành phố
+- Tin tức mới nhất
+- Thông tin tổng quát (ai là tổng thống, tỷ giá USD...)
+
+Xem hướng dẫn cấu hình: [GOOGLE_SEARCH_SETUP.md](GOOGLE_SEARCH_SETUP.md)
 
 ## Tính năng
 
@@ -194,3 +206,18 @@ Bot tự động phân loại dựa trên từ khóa:
 - Biểu đồ trực quan
 - Xuất Excel chuyên nghiệp
 - Cảnh sát chi tiêu
+
+## Bản quyền
+
+Copyright (c) 2025 Lộc
+
+Tất cả các quyền được bảo lưu. Phần mềm này là tài sản riêng và bảo mật. 
+Việc sao chép, sửa đổi, phân phối hoặc sử dụng trái phép phần mềm này, 
+qua bất kỳ phương tiện nào, đều bị nghiêm cấm.
+
+Xem file [LICENSE](LICENSE) để biết thêm chi tiết về giấy phép.
+
+---
+
+**Tác giả:** Lộc  
+**Năm phát triển:** 2025

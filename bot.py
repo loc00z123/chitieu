@@ -1,7 +1,13 @@
 """
-Telegram Bot Quản Lý Chi Tiêu - ExpenseBot Enterprise Edition
-Sử dụng Smart Pattern Matching - Không cần AI
-Phiên bản Enterprise với Multi-Line Parsing, Báo Cáo, Biểu Đồ và Xuất Excel
+Telegram Bot Quản Lý Chi Tiêu - ExpenseBot Super Multimodal AI Edition
+Sử dụng Groq AI (Llama 3.3 70B, Vision, Whisper) + Smart Pattern Matching Fallback
+Phiên bản Super Multimodal với Text, Voice, Vision, RAG Context
+
+Copyright (c) 2025 Lộc
+All rights reserved.
+
+This software is proprietary and confidential. Unauthorized copying, modification,
+distribution, or use of this software, via any medium, is strictly prohibited.
 """
 
 import os
@@ -9,6 +15,9 @@ import re
 import json
 import logging
 import io
+import base64
+import tempfile
+import requests
 from datetime import datetime, timedelta, time as dt_time
 from collections import defaultdict
 from dotenv import load_dotenv
@@ -26,6 +35,17 @@ from openpyxl import Workbook
 from openpyxl.styles import Font, Alignment, PatternFill
 from openpyxl.utils import get_column_letter
 from keep_alive import keep_alive
+from services import (
+    init_google_sheets,
+    save_expenses_to_sheet,
+    calculate_weekly_spend,
+    get_financial_context,
+    get_expense_report,
+    get_worksheet,
+    google_search,
+    generate_image,
+    generate_vietqr_url
+)
 
 # Load biến môi trường từ file .env
 load_dotenv()
@@ -38,11 +58,48 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Import Text-to-Speech
+try:
+    from gtts import gTTS
+    from pydub import AudioSegment
+    TTS_AVAILABLE = True
+except ImportError:
+    TTS_AVAILABLE = False
+    logger.warning("⚠️ gTTS hoặc pydub chưa được cài đặt. Voice Reply sẽ bị tắt.")
+
+# Import Groq AI
+try:
+    from groq import Groq
+    GROQ_AVAILABLE = True
+except ImportError:
+    GROQ_AVAILABLE = False
+    logger.warning("⚠️ Groq library not installed. AI features will be disabled.")
+
 # ==================== CẤU HÌNH ====================
 TELEGRAM_TOKEN = os.getenv('BOT_TOKEN', '')
 CREDENTIALS_FILE = 'credentials.json'
 SHEET_NAME = 'QuanLyChiTieu'
 SHEET_ID = os.getenv('GOOGLE_SHEET_ID', '')
+
+# ==================== CẤU HÌNH GROQ AI ====================
+GROQ_API_KEY = os.getenv('GROQ_API_KEY', '')
+groq_client = None
+groq_disabled = False  # Flag để tạm thời disable Groq nếu quota hết
+GROQ_PRIORITY = True  # Ưu tiên sử dụng Groq AI
+
+if GROQ_AVAILABLE and GROQ_API_KEY:
+    try:
+        groq_client = Groq(api_key=GROQ_API_KEY)
+        logger.info("✅ Đã khởi tạo Groq AI client (Llama 3)")
+    except Exception as e:
+        logger.warning(f"⚠️ Không thể khởi tạo Groq client: {e}")
+        groq_client = None
+elif not GROQ_AVAILABLE:
+    logger.warning("⚠️ Groq library chưa được cài đặt. Chạy: pip install groq")
+elif not GROQ_API_KEY:
+    logger.info("ℹ️ GROQ_API_KEY chưa được cấu hình. Bot sẽ sử dụng Regex fallback.")
+else:
+    groq_client = None
 
 # ==================== CẤU HÌNH NGÂN SÁCH TUẦN ====================
 WEEKLY_LIMIT = 700000  # 700 nghìn đồng/tuần
@@ -75,6 +132,49 @@ def save_reminders():
 
 # Load reminders khi khởi động
 load_reminders()
+
+# ==================== CHAT MEMORY (SHORT-TERM MEMORY) ====================
+chat_memory = {}  # {user_id: [{'role': 'user'|'bot', 'content': '...'}]}
+MAX_MEMORY_MESSAGES = 6  # Tối đa 6 tin nhắn (3 user, 3 bot)
+
+def format_chat_history(user_id: int) -> str:
+    """
+    Format lịch sử chat của user thành chuỗi text
+    Trả về chuỗi rỗng nếu không có lịch sử
+    """
+    if user_id not in chat_memory or not chat_memory[user_id]:
+        return ""
+    
+    history_lines = ["Lịch sử trò chuyện:"]
+    for msg in chat_memory[user_id]:
+        role = msg.get('role', '')
+        content = msg.get('content', '')
+        if role == 'user':
+            history_lines.append(f"User: {content}")
+        elif role == 'bot':
+            history_lines.append(f"Bot: {content}")
+    
+    return "\n".join(history_lines)
+
+def add_to_memory(user_id: int, role: str, content: str):
+    """
+    Thêm tin nhắn vào memory của user
+    Tự động giới hạn tối đa MAX_MEMORY_MESSAGES
+    """
+    if user_id not in chat_memory:
+        chat_memory[user_id] = []
+    
+    # Thêm tin nhắn mới
+    chat_memory[user_id].append({
+        'role': role,
+        'content': content
+    })
+    
+    # Giới hạn số lượng tin nhắn
+    if len(chat_memory[user_id]) > MAX_MEMORY_MESSAGES:
+        chat_memory[user_id] = chat_memory[user_id][-MAX_MEMORY_MESSAGES:]
+    
+    logger.info(f"💾 Đã lưu vào memory: {role} - {content[:50]}... (Total: {len(chat_memory[user_id])} messages)")
 
 logger.info("=" * 60)
 logger.info("KHỞI ĐỘNG BOT QUẢN LÝ CHI TIÊU (Enterprise Edition)")
@@ -234,13 +334,398 @@ def parse_single_item(text: str) -> dict:
     }
 
 
+def parse_with_groq(input_data, context_data: str = "", input_type: str = 'text', chat_history: str = "") -> dict:
+    """
+    Bộ Não Trung Tâm - Xử lý đa modal với Groq AI
+    - input_data: Text hoặc nội dung ảnh (base64)
+    - context_data: Financial context từ Google Sheet
+    - input_type: 'text', 'image', 'voice'
+    - chat_history: Lịch sử trò chuyện gần nhất
+    Trả về dict với:
+    - type: "expense" hoặc "chat"
+    - expenses: list (nếu type == "expense")
+    - message: str (nếu type == "expense")
+    - response: str (nếu type == "chat")
+    """
+    if not groq_client:
+        raise Exception("Groq client không khả dụng")
+    
+    logger.info("=" * 60)
+    logger.info(f"🤖 ĐANG SỬ DỤNG GROQ AI - Input Type: {input_type}")
+    logger.info("=" * 60)
+    
+    # Lấy thời gian hiện tại để xử lý backdated entry
+    current_time = datetime.now()
+    current_time_str = current_time.strftime('%Y-%m-%d %H:%M:%S')
+    current_date_str = current_time.strftime('%d/%m/%Y')
+    
+    # Chọn model dựa trên input type
+    if input_type == 'image':
+        model = "llama-3.2-90b-vision-preview"
+        logger.info("📷 Sử dụng Vision Model (90B)")
+    else:
+        model = "llama-3.3-70b-versatile"
+        logger.info("💬 Sử dụng Text Model")
+    
+    # System Prompt - Tách biệt context khỏi system prompt
+    if input_type == 'image':
+        # System Prompt cho Vision (đọc hóa đơn) - Tối ưu cho model 90B
+        system_prompt = (
+            "Bạn là AI Vision chuyên đọc hóa đơn tiếng Việt.\n"
+            "Nhiệm vụ: Trích xuất danh sách món ăn và giá tiền từ ảnh hóa đơn.\n\n"
+            "Output JSON format:\n"
+            "{\"type\": \"expense\", \"expenses\": [{\"item\": \"Tên món\", \"amount\": 123000, \"category\": \"Ăn uống\"}], \"message\": \"Đã đọc hóa đơn...\"}\n\n"
+            "Quy tắc:\n"
+            "- Nếu ảnh mờ hoặc không phải hóa đơn, trả về type: \"chat\" và nhắc user chụp lại.\n"
+            "- Ưu tiên tìm dòng \"Tổng cộng\" (Total) nếu danh sách món quá dài hoặc mờ.\n"
+            "- Chỉ lấy các món có giá tiền rõ ràng.\n"
+            "- Bỏ qua ngày giờ, địa chỉ quán, thông tin không liên quan.\n"
+            "- Category: Dựa vào tên món (phở/cơm/bún -> Ăn uống, xăng/grab -> Di chuyển, sách/vở -> Học tập, còn lại -> Khác).\n\n"
+            "LUÔN trả về JSON chuẩn. Không markdown."
+        )
+    else:
+        # System Prompt cho Text - Cải thiện phân loại + Chat History + Backdated Entry + Google Search
+        system_prompt = (
+            "Bạn là Trợ lý AI thông minh của Lộc.\n"
+            f"Thời gian hiện tại của hệ thống là: {current_time_str} (Ngày: {current_date_str}).\n"
+            "Dữ liệu hệ thống và lịch sử trò chuyện sẽ được cung cấp trong user message.\n\n"
+            "PHÂN LOẠI INPUT (QUAN TRỌNG):\n\n"
+            "1. **TYPE: \"expense\"** (Chỉ khi User nhập khoản chi MỚI):\n"
+            "   - VD: \"phở 50k\", \"đổ xăng 200k\", \"mua rau 20k\", \"ăn trưa 35k, cafe 25k\".\n"
+            "   - Đặc điểm: Có tên món + số tiền, là hành động CHI TIÊU MỚI.\n"
+            "   - Output: {\"type\": \"expense\", \"expenses\": [{\"item\": \"tên món\", \"amount\": số_tiền_int, \"category\": \"Ăn uống/Di chuyển/Học tập/Khác\", \"date\": \"DD/MM/YYYY\" hoặc null}], \"message\": \"...\", \"image_prompt\": \"...\" (tùy chọn)}\n"
+            "   - **image_prompt** (Tùy chọn): Nếu user tiêu hoang (>500k hoặc game/trà sữa), hãy thêm field này với prompt mô tả cảnh nghèo khổ/hài hước bằng tiếng Anh (VD: \"poor student eating instant noodles, anime style\").\n\n"
+            "2. **TYPE: \"search\"** (Khi User hỏi về dữ liệu thực tế cần tìm kiếm):\n"
+            "   - VD: \"Giá vàng hôm nay\", \"Ai là tổng thống Mỹ\", \"Thời tiết Hà Nội\", \"Giá xăng hôm nay\", \"Tin tức mới nhất\".\n"
+            "   - Đặc điểm: Câu hỏi cần dữ liệu thực tế, cập nhật, hoặc thông tin không có trong hệ thống.\n"
+            "   - Output: {\"type\": \"search\", \"query\": \"từ khóa tìm kiếm ngắn gọn\"}\n"
+            "   - Lưu ý: Đừng trả lời bừa. Nếu không chắc chắn, hãy yêu cầu tìm kiếm.\n\n"
+            "3. **TYPE: \"qr_request\"** (Khi User yêu cầu tạo mã QR chuyển khoản):\n"
+            "   - VD: \"tạo mã qr 50k\", \"tạo cho tôi cái mã qr mệnh giá 20k nội dung là tra no\", \"qr code 100k tiền cafe\", \"mã chuyển khoản 500k\".\n"
+            "   - Đặc điểm: User muốn tạo mã QR để nhận tiền chuyển khoản, có số tiền và nội dung (tùy chọn).\n"
+            "   - Output: {\"type\": \"qr_request\", \"amount\": số_tiền_int, \"content\": \"nội dung chuyển khoản\" hoặc \"\"}\n"
+            "   - Lưu ý: Phải trích xuất số tiền từ text (xử lý 'k', 'tr', 'ng', 'nghìn', 'triệu'). Nếu không có nội dung, để content = \"\".\n\n"
+            "4. **TYPE: \"chat\"** (Khi User hỏi về dữ liệu hệ thống, tra cứu, hoặc tâm sự):\n"
+            "   - VD: \"hôm nay tiêu bao nhiêu?\", \"tài chính thế nào?\", \"còn bao nhiêu tiền?\", \"danh sách chi tiêu hôm nay\", \"chào em\", \"cảm ơn\".\n"
+            "   - Đặc điểm: Là câu HỎI về dữ liệu hệ thống, TRA CỨU, hoặc TÂM SỰ, KHÔNG phải nhập liệu mới.\n"
+            "   - Output: {\"type\": \"chat\", \"response\": \"Câu trả lời dựa trên Dữ liệu hệ thống...\"}\n"
+            "   - Lưu ý: Nếu user hỏi \"tiêu bao nhiêu\", hãy nhìn vào mục 'Hôm nay' hoặc 'Tháng này' trong dữ liệu hệ thống để trả lời chính xác con số.\n\n"
+            "XỬ LÝ NGÀY THÁNG (BACKDATED ENTRY - QUAN TRỌNG):\n"
+            f"Thời gian hiện tại: {current_time_str} (Ngày: {current_date_str}).\n"
+            "Nhiệm vụ: Trích xuất chi tiêu và NGÀY THÁNG từ input.\n\n"
+            "Quy tắc:\n"
+            "- Nếu user nói \"Hôm qua\", \"Tối qua\" -> Tính ra ngày hôm qua (so với hiện tại).\n"
+            "- Nếu user nói \"Hôm kia\" -> Tính ra ngày hôm kia.\n"
+            "- Nếu user nói \"Sáng nay\", \"Tối nay\" -> Dùng ngày hiện tại (date = null).\n"
+            "- Nếu user nói \"Ngày 10/12\", \"10/12\" -> Lấy ngày 10/12/{current_time.year}.\n"
+            "- Nếu user nói \"Tuần trước\", \"Tháng trước\" -> Tính toán ngày tương ứng.\n"
+            "- Nếu không nhắc gì về thời gian -> Mặc định là ngày hiện tại (trả về null hoặc empty).\n\n"
+            "Output JSON thêm trường \"date\":\n"
+            "{\"type\": \"expense\", \"expenses\": [{\"item\": \"...\", \"amount\": ..., \"category\": \"...\", \"date\": \"DD/MM/YYYY\" hoặc null}]}\n\n"
+            "Ví dụ:\n"
+            f"  + Input: \"Hôm qua đổ xăng 50k\" (Hôm nay là {current_date_str}) -> Output date: tính ngày hôm qua.\n"
+            f"  + Input: \"Ngày 10/12 mua áo 200k\" -> Output date: \"10/12/{current_time.year}\".\n"
+            "  + Input: \"Ăn cơm 30k\" (không có thông tin ngày) -> Output date: null.\n\n"
+            "XỬ LÝ LỊCH SỬ TRÒ CHUYỆN:\n"
+            "- Nếu có lịch sử trò chuyện, hãy tham khảo để hiểu ngữ cảnh.\n"
+            "- Khi user hỏi \"chi tiết hơn\", \"tại sao\", \"giải thích\" -> Tham khảo lịch sử để biết user đang hỏi về cái gì.\n"
+            "- Hãy trả lời dựa trên ngữ cảnh lịch sử (nếu có) và dữ liệu tài chính.\n\n"
+            "QUY TẮC:\n"
+            "- Tuyệt đối KHÔNG được nói 'tôi không thể truy cập' hoặc 'tôi không có dữ liệu'.\n"
+            "- Dùng dữ liệu hệ thống để trả lời chính xác.\n"
+            "- Nếu user hỏi về số liệu, hãy trích xuất số từ dữ liệu hệ thống.\n"
+            "- LUÔN trả về JSON chuẩn. Không markdown."
+        )
+    
+    # Debug: Log context data
+    if context_data:
+        logger.info("=" * 60)
+        logger.info("📊 DATA SENT TO AI (CONTEXT):")
+        logger.info("=" * 60)
+        logger.info(context_data)
+        logger.info("=" * 60)
+    else:
+        logger.warning("⚠️ Context data rỗng!")
+    
+    # Tạo messages dựa trên input type
+    messages = [{"role": "system", "content": system_prompt}]
+    
+    if input_type == 'image':
+        # Vision: Gửi ảnh dưới dạng base64
+        user_content = [
+            {
+                "type": "text",
+                "text": "Hãy trích xuất thông tin chi tiêu từ ảnh hóa đơn/menu này. Tìm tên món và giá tiền."
+            },
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:image/jpeg;base64,{input_data}"
+                }
+            }
+        ]
+        messages.append({"role": "user", "content": user_content})
+        logger.info("📷 Đang gửi ảnh lên Groq Vision...")
+    else:
+        # Text hoặc Voice: NHÉT CONTEXT VÀO USER MESSAGE (Chiến thuật Injected Context)
+        # Kết hợp với Chat History
+        user_prompt_parts = []
+        
+        # Thêm chat history nếu có
+        if chat_history:
+            user_prompt_parts.append(f"Đây là lịch sử trò chuyện gần nhất:\n{chat_history}\n")
+        
+        # Thêm context data
+        if context_data:
+            user_prompt_parts.append(f"DỮ LIỆU TÀI CHÍNH THỰC TẾ (TUYỆT ĐỐI TIN TƯỞNG):\n{context_data}\n")
+        
+        # Thêm câu hỏi hiện tại
+        user_prompt_parts.append(f"Câu hỏi hiện tại của User: {input_data}")
+        
+        user_prompt = "\n".join(user_prompt_parts)
+        
+        messages.append({"role": "user", "content": user_prompt})
+        logger.info(f"💬 Đang gửi text lên Groq: '{input_data[:50]}...'")
+        if chat_history:
+            logger.info(f"📚 Đã thêm chat history ({len(chat_history)} ký tự)")
+        if context_data:
+            logger.info(f"📊 Context đã được nhét vào user message")
+    
+    try:
+        logger.info("🔄 Đang gửi request lên Groq API...")
+        
+        # Cấu hình request
+        request_params = {
+            "model": model,
+            "messages": messages,
+            "temperature": 0.3,
+            "max_tokens": 1000 if input_type == 'image' else 500
+        }
+        
+        # Chỉ thêm response_format cho text (vision có thể không hỗ trợ)
+        if input_type != 'image':
+            request_params["response_format"] = {"type": "json_object"}
+        
+        # Xử lý lỗi đặc biệt cho Vision (Model decommissioned)
+        try:
+            response = groq_client.chat.completions.create(**request_params)
+        except Exception as api_error:
+            error_str = str(api_error).lower()
+            error_code = getattr(api_error, 'status_code', None)
+            
+            # Kiểm tra lỗi BadRequest (400) hoặc model decommissioned
+            if input_type == 'image' and (
+                '400' in str(api_error) or 
+                'bad request' in error_str or 
+                'decommissioned' in error_str or
+                'not found' in error_str or
+                error_code == 400
+            ):
+                logger.warning("=" * 60)
+                logger.warning("⚠️ Vision Model đang bảo trì hoặc bị đổi tên")
+                logger.warning(f"⚠️ Error: {api_error}")
+                logger.warning("=" * 60)
+                # Trả về JSON cho user
+                return {
+                    "type": "chat",
+                    "response": "❌ Tính năng đọc ảnh đang bảo trì do Lộc thay đổi Model. Vui lòng nhập tay nhé sếp!"
+                }
+            else:
+                # Re-raise lỗi khác để xử lý ở ngoài
+                raise
+        
+        # Kiểm tra response hợp lệ
+        if not response or not response.choices or len(response.choices) == 0:
+            raise ValueError("Groq trả về response rỗng")
+        
+        # Lấy raw content để debug
+        raw_content = response.choices[0].message.content.strip()
+        
+        # Kiểm tra nếu response rỗng
+        if not raw_content:
+            raise ValueError("Groq trả về nội dung rỗng")
+        
+        logger.info(f"📥 Groq raw response: {raw_content}")
+        
+        # Parse JSON
+        try:
+            response_data = json.loads(raw_content)
+            
+            # Kiểm tra format: phải là dict
+            if not isinstance(response_data, dict):
+                raise ValueError("Groq trả về không phải JSON object")
+            
+            # Kiểm tra type
+            response_type = response_data.get('type', '').lower()
+            
+            if response_type == 'search':
+                # Xử lý search request
+                if 'query' not in response_data:
+                    raise ValueError("Groq response không có key 'query' cho search")
+                
+                search_query = response_data['query']
+                logger.info(f"✅ Groq AI yêu cầu tìm kiếm: '{search_query}'")
+                
+                return {
+                    'type': 'search',
+                    'query': search_query
+                }
+            elif response_type == 'qr_request':
+                # Xử lý QR request
+                if 'amount' not in response_data:
+                    raise ValueError("Groq response không có key 'amount' cho qr_request")
+                
+                amount = response_data['amount']
+                content = response_data.get('content', '')
+                
+                # Validate amount
+                if not isinstance(amount, int) or amount <= 0:
+                    raise ValueError(f"Amount không hợp lệ: {amount}")
+                
+                logger.info(f"✅ Groq AI yêu cầu tạo QR: {amount:,}đ - '{content}'")
+                
+                return {
+                    'type': 'qr_request',
+                    'amount': amount,
+                    'content': content
+                }
+            elif response_type == 'expense':
+                # Xử lý chi tiêu
+                if 'expenses' not in response_data:
+                    raise ValueError("Groq response không có key 'expenses'")
+                
+                expenses_data = response_data['expenses']
+                
+                # Đảm bảo là list
+                if not isinstance(expenses_data, list):
+                    expenses_data = [expenses_data] if expenses_data else []
+                
+                # Validate và format kết quả
+                results = []
+                for item in expenses_data:
+                    if not isinstance(item, dict):
+                        continue
+                    
+                    # Validate required fields
+                    if 'item' not in item or 'amount' not in item:
+                        logger.warning(f"⚠️ Item thiếu field: {item}")
+                        continue
+                    
+                    # Validate category
+                    category = item.get('category', 'Khác')
+                    if category not in ['Ăn uống', 'Di chuyển', 'Học tập', 'Khác']:
+                        category = 'Khác'
+                    
+                    # Validate amount (phải là số)
+                    try:
+                        amount = int(item['amount'])
+                        if amount <= 0:
+                            logger.warning(f"⚠️ Amount <= 0: {amount}")
+                            continue
+                    except (ValueError, TypeError):
+                        logger.warning(f"⚠️ Amount không hợp lệ: {item.get('amount')}")
+                        continue
+                    
+                    # Xử lý item name
+                    item_name = str(item['item']).strip()
+                    if not item_name or item_name == "Chưa rõ":
+                        item_name = "Không xác định"
+                    
+                    # Xử lý date (backdated entry)
+                    expense_date = item.get('date')
+                    if expense_date:
+                        # Validate format DD/MM/YYYY
+                        try:
+                            # Kiểm tra format
+                            if isinstance(expense_date, str) and '/' in expense_date:
+                                # Giữ nguyên date string để parse sau
+                                logger.info(f"📅 Expense có date: {expense_date}")
+                            else:
+                                expense_date = None
+                        except:
+                            expense_date = None
+                    else:
+                        expense_date = None
+                    
+                    expense_dict = {
+                        'item': item_name,
+                        'amount': amount,
+                        'category': category
+                    }
+                    if expense_date:
+                        expense_dict['date'] = expense_date
+                    
+                    results.append(expense_dict)
+                
+                if not results:
+                    raise ValueError("Groq trả về list expenses rỗng")
+                
+                # Lấy message từ AI (nếu có)
+                ai_message = response_data.get('message', '')
+                
+                logger.info(f"✅ Groq AI đã phân tích thành công {len(results)} món")
+                for i, expense in enumerate(results, 1):
+                    logger.info(f"  {i}. {expense['item']}: {expense['amount']:,}đ ({expense['category']})")
+                if ai_message:
+                    logger.info(f"💬 AI message: {ai_message}")
+                logger.info("=" * 60)
+                
+                return {
+                    'type': 'expense',
+                    'expenses': results,
+                    'message': ai_message
+                }
+                
+            elif response_type == 'chat':
+                # Xử lý chat
+                if 'response' not in response_data:
+                    raise ValueError("Groq response không có key 'response'")
+                
+                chat_response = response_data.get('response', '')
+                
+                if not chat_response:
+                    raise ValueError("Groq trả về response rỗng")
+                
+                logger.info(f"✅ Groq AI đã phân tích: Chat mode")
+                logger.info(f"💬 AI response: {chat_response}")
+                logger.info("=" * 60)
+                
+                return {
+                    'type': 'chat',
+                    'response': chat_response
+                }
+            else:
+                raise ValueError(f"Groq trả về type không hợp lệ: {response_type}")
+            
+        except json.JSONDecodeError as e:
+            logger.error(f"❌ Lỗi parse JSON từ Groq: {e}")
+            logger.error(f"📝 Raw response: {raw_content}")
+            raise ValueError(f"Groq trả về JSON không hợp lệ: {e}")
+            
+    except Exception as e:
+        error_str = str(e).lower()
+        # Kiểm tra các loại lỗi phổ biến
+        if 'quota' in error_str or 'rate limit' in error_str or '429' in error_str:
+            logger.warning("=" * 60)
+            logger.warning("⚠️ GROQ API QUOTA ĐÃ HẾT")
+            logger.warning("=" * 60)
+            logger.warning("💡 Bot sẽ tự động chuyển sang Regex Parsing")
+            logger.warning("💡 Kiểm tra quota tại: https://console.groq.com/usage")
+            logger.warning("=" * 60)
+        elif 'api key' in error_str or '401' in error_str or '403' in error_str:
+            logger.warning("⚠️ Lỗi xác thực Groq API (API Key không hợp lệ)")
+        else:
+            logger.error(f"❌ Lỗi khi gọi Groq API: {e}")
+        raise
+
+
 def parse_multiple_items(text: str) -> list:
     """
-    Parse nhiều món từ một tin nhắn
+    Parse nhiều món từ một tin nhắn (Regex Fallback)
     Hỗ trợ phân cách bởi dấu phẩy hoặc xuống dòng
     """
     logger.info("=" * 60)
-    logger.info("BƯỚC 1: PHÂN TÍCH NHIỀU MÓN (Multi-Line Parsing)")
+    logger.info("🔍 ĐANG SỬ DỤNG REGEX PARSING (Fallback)")
     logger.info("=" * 60)
     logger.info(f"📝 Text nhận được: '{text}'")
     
@@ -275,71 +760,21 @@ def parse_multiple_items(text: str) -> list:
     return results
 
 
-# ==================== KẾT NỐI GOOGLE SHEETS ====================
-def init_google_sheets():
-    """Khởi tạo kết nối với Google Sheets"""
-    logger.info("=" * 60)
-    logger.info("BƯỚC 2: KIỂM TRA KẾT NỐI GOOGLE SHEETS")
-    logger.info("=" * 60)
-    
-    try:
-        # Xử lý credentials: Nếu không có file, tạo từ biến môi trường (cho Cloud deployment)
-        if not os.path.exists(CREDENTIALS_FILE):
-            logger.info(f"⚠️ Không tìm thấy file {CREDENTIALS_FILE}, đang kiểm tra biến môi trường...")
-            credentials_json = os.getenv('GSPREAD_CREDENTIALS_JSON')
-            
-            if credentials_json:
-                logger.info("✅ Tìm thấy GSPREAD_CREDENTIALS_JSON, đang tạo file credentials.json...")
-                with open(CREDENTIALS_FILE, 'w', encoding='utf-8') as f:
-                    f.write(credentials_json)
-                logger.info(f"✅ Đã tạo file {CREDENTIALS_FILE} từ biến môi trường")
-            else:
-                logger.critical(f"❌ CRITICAL ERROR: Không tìm thấy file {CREDENTIALS_FILE} và không có biến môi trường GSPREAD_CREDENTIALS_JSON!")
-                raise FileNotFoundError(f"Không tìm thấy file {CREDENTIALS_FILE} và không có biến môi trường GSPREAD_CREDENTIALS_JSON")
-        
-        scope = [
-            'https://spreadsheets.google.com/feeds',
-            'https://www.googleapis.com/auth/drive'
-        ]
-        
-        creds = ServiceAccountCredentials.from_json_keyfile_name(CREDENTIALS_FILE, scope)
-        service_email = creds.service_account_email
-        logger.info(f"✅ Service Account: {service_email}")
-        
-        client = gspread.authorize(creds)
-        logger.info("✅ Đã kết nối với Google Sheets API")
-        
-        if SHEET_ID:
-            sheet = client.open_by_key(SHEET_ID)
-        else:
-            sheet = client.open(SHEET_NAME)
-        
-        logger.info(f"✅ Đã mở Sheet: {sheet.title}")
-        
-        worksheet = sheet.sheet1
-        logger.info(f"✅ Đã chọn worksheet: {worksheet.title}")
-        
-        existing_data = worksheet.get_all_values()
-        if not existing_data:
-            logger.info("📝 Sheet trống, đang tạo header mới (7 cột)...")
-            worksheet.append_row(['Full Time', 'Ngày', 'Tháng', 'Năm', 'Tên món', 'Phân loại', 'Số tiền'])
-            logger.info("✅ Đã tạo header cho Sheet")
-        else:
-            logger.info(f"✅ Sheet đã có {len(existing_data)} dòng dữ liệu")
-            # Kiểm tra header cũ, nếu cần thì cập nhật
-            if len(existing_data[0]) < 7:
-                logger.warning("⚠️ Header cũ có ít hơn 7 cột, nhưng sẽ tiếp tục ghi dữ liệu mới")
-        
-        logger.info("=" * 60)
-        logger.info("✅ KẾT NỐI GOOGLE SHEETS THÀNH CÔNG!")
-        logger.info("=" * 60)
-        return worksheet
-        
-    except Exception as e:
-        logger.critical(f"❌ CRITICAL ERROR: {e}")
-        raise
+from keep_alive import keep_alive
+from services import (
+    init_google_sheets,
+    save_expenses_to_sheet,
+    calculate_weekly_spend,
+    get_financial_context,
+    get_expense_report,
+    get_worksheet,
+    google_search,
+    generate_image,
+    generate_vietqr_url
+)
 
-worksheet = None
+# ==================== KẾT NỐI GOOGLE SHEETS ====================
+# Sử dụng hàm từ services.py
 try:
     worksheet = init_google_sheets()
 except Exception as e:
@@ -347,204 +782,8 @@ except Exception as e:
     raise
 
 # ==================== LƯU VÀO GOOGLE SHEET ====================
-def save_expenses_to_sheet(expenses: list) -> list:
-    """
-    Lưu nhiều chi tiêu vào Google Sheet
-    Format: [Full Time, Ngày, Tháng, Năm, Tên món, Phân loại, Số tiền]
-    """
-    logger.info("=" * 60)
-    logger.info("BƯỚC 3: GHI VÀO GOOGLE SHEET")
-    logger.info("=" * 60)
-    
-    if worksheet is None:
-        raise ValueError("Google Sheets chưa được khởi tạo")
-    
-    now = datetime.now()
-    full_time = now.strftime('%Y-%m-%d %H:%M:%S')
-    day = now.day
-    month = now.month
-    year = now.year
-    
-    logger.info(f"⏰ Thời gian: {full_time} ({day}/{month}/{year})")
-    
-    saved_items = []
-    
-    try:
-        for i, expense in enumerate(expenses, 1):
-            item_name = expense.get('item', 'Không xác định')
-            amount = expense.get('amount', 0)
-            category = expense.get('category', 'Khác')
-            
-            row = [full_time, day, month, year, item_name, category, amount]
-            logger.info(f"💾 Đang ghi món {i}: {item_name} - {amount:,}đ")
-            worksheet.append_row(row)
-            saved_items.append(expense)
-        
-        logger.info("=" * 60)
-        logger.info(f"✅ Đã ghi thành công {len(saved_items)} món vào Sheet!")
-        logger.info("=" * 60)
-        
-        return saved_items
-        
-    except Exception as e:
-        logger.error(f"❌ Lỗi khi lưu vào Google Sheet: {e}")
-        raise
-
-
-# ==================== TÍNH TOÁN CHI TIÊU TUẦN ====================
-def calculate_weekly_spend() -> dict:
-    """
-    Tính toán chi tiêu tuần hiện tại (Thứ 2 - Chủ Nhật)
-    Trả về: {'total': tổng tiền, 'remaining': số dư còn lại, 'percentage': phần trăm đã dùng}
-    """
-    logger.info("=" * 60)
-    logger.info("BƯỚC: TÍNH TOÁN CHI TIÊU TUẦN")
-    logger.info("=" * 60)
-    
-    if worksheet is None:
-        raise ValueError("Google Sheets chưa được khởi tạo")
-    
-    try:
-        # Xác định tuần hiện tại (Thứ 2 - Chủ Nhật)
-        now = datetime.now()
-        # Tìm Thứ 2 của tuần này (weekday() trả về 0=Monday, 6=Sunday)
-        days_since_monday = now.weekday()  # 0 = Monday, 6 = Sunday
-        monday = now - timedelta(days=days_since_monday)
-        monday = monday.replace(hour=0, minute=0, second=0, microsecond=0)
-        sunday = monday + timedelta(days=6)
-        sunday = sunday.replace(hour=23, minute=59, second=59)
-        
-        logger.info(f"📅 Tuần hiện tại: {monday.strftime('%d/%m/%Y')} - {sunday.strftime('%d/%m/%Y')}")
-        
-        # Đọc dữ liệu từ Sheet
-        all_data = worksheet.get_all_values()
-        if len(all_data) <= 1:  # Chỉ có header
-            return {
-                'total': 0,
-                'remaining': WEEKLY_LIMIT,
-                'percentage': 0.0,
-                'monday': monday,
-                'sunday': sunday
-            }
-        
-        data_rows = all_data[1:]
-        week_total = 0
-        
-        for row in data_rows:
-            if len(row) < 7:
-                continue
-            
-            try:
-                # Đọc từ Sheet (cột 2,3,4 là Ngày, Tháng, Năm; cột 7 là Số tiền)
-                row_day = int(row[1]) if row[1] else 0
-                row_month = int(row[2]) if row[2] else 0
-                row_year = int(row[3]) if row[3] else 0
-                amount = int(row[6]) if row[6] else 0
-                
-                # Tạo datetime từ dữ liệu
-                try:
-                    row_date = datetime(row_year, row_month, row_day)
-                    # Kiểm tra xem có nằm trong tuần này không
-                    if monday <= row_date <= sunday:
-                        week_total += amount
-                except ValueError:
-                    continue
-                    
-            except (ValueError, IndexError) as e:
-                logger.warning(f"⚠️ Lỗi đọc dòng: {e}")
-                continue
-        
-        remaining = WEEKLY_LIMIT - week_total
-        percentage = (week_total / WEEKLY_LIMIT * 100) if WEEKLY_LIMIT > 0 else 0
-        
-        logger.info(f"✅ Tuần này đã tiêu: {week_total:,}đ / {WEEKLY_LIMIT:,}đ ({percentage:.1f}%)")
-        logger.info(f"💰 Còn dư: {remaining:,}đ")
-        
-        return {
-            'total': week_total,
-            'remaining': remaining,
-            'percentage': percentage,
-            'monday': monday,
-            'sunday': sunday
-        }
-        
-    except Exception as e:
-        logger.error(f"❌ Lỗi khi tính toán chi tiêu tuần: {e}")
-        raise
-
-
-# ==================== BÁO CÁO CHI TIÊU ====================
-def get_expense_report() -> dict:
-    """Đọc dữ liệu từ Sheet và tính toán báo cáo"""
-    logger.info("=" * 60)
-    logger.info("BƯỚC: ĐỌC DỮ LIỆU TỪ SHEET")
-    logger.info("=" * 60)
-    
-    if worksheet is None:
-        raise ValueError("Google Sheets chưa được khởi tạo")
-    
-    try:
-        all_data = worksheet.get_all_values()
-        if len(all_data) <= 1:  # Chỉ có header
-            return {
-                'today_total': 0,
-                'month_total': 0,
-                'top_expenses': []
-            }
-        
-        # Bỏ qua header
-        data_rows = all_data[1:]
-        
-        now = datetime.now()
-        today = now.day
-        current_month = now.month
-        current_year = now.year
-        
-        today_total = 0
-        month_total = 0
-        category_totals = defaultdict(int)
-        
-        for row in data_rows:
-            if len(row) < 7:
-                continue
-            
-            try:
-                # Đọc từ Sheet (cột 2,3,4 là Ngày, Tháng, Năm; cột 7 là Số tiền)
-                row_day = int(row[1]) if row[1] else 0
-                row_month = int(row[2]) if row[2] else 0
-                row_year = int(row[3]) if row[3] else 0
-                amount = int(row[6]) if row[6] else 0
-                category = row[5] if len(row) > 5 else 'Khác'
-                item_name = row[4] if len(row) > 4 else 'Không xác định'
-                
-                # Tính tổng hôm nay
-                if row_day == today and row_month == current_month and row_year == current_year:
-                    today_total += amount
-                
-                # Tính tổng tháng này
-                if row_month == current_month and row_year == current_year:
-                    month_total += amount
-                    category_totals[category] += amount
-                    
-            except (ValueError, IndexError) as e:
-                logger.warning(f"⚠️ Lỗi đọc dòng: {e}")
-                continue
-        
-        # Sắp xếp top chi tiêu theo category
-        top_expenses = sorted(category_totals.items(), key=lambda x: x[1], reverse=True)[:5]
-        
-        logger.info(f"✅ Đã tính toán: Hôm nay {today_total:,}đ, Tháng này {month_total:,}đ")
-        
-        return {
-            'today_total': today_total,
-            'month_total': month_total,
-            'top_expenses': top_expenses
-        }
-        
-    except Exception as e:
-        logger.error(f"❌ Lỗi khi đọc Sheet: {e}")
-        raise
-
+# Hàm đã được tách ra services.py, import ở trên
+# Không cần định nghĩa lại, sử dụng trực tiếp từ services
 
 # ==================== HOÀN TÁC (UNDO) ====================
 def undo_last_expense() -> dict:
@@ -669,7 +908,13 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "  → Xuất báo cáo Excel tháng này\n"
         "  → File Excel chuyên nghiệp, có format đẹp\n\n"
         
-        "🔧 **3. QUẢN LÝ**\n"
+        "💳 **3. MÃ QR CHUYỂN KHOẢN**\n"
+        "• `/pay 50k trả tiền cơm`\n"
+        "  → Tạo mã QR chuyển khoản nhanh VietQR\n"
+        "  → Quét mã để chuyển tiền cho sếp Lộc\n"
+        "• `/qr 100k tiền cafe` - Alias cho /pay\n\n"
+        
+        "🔧 **4. QUẢN LÝ**\n"
         "• `/undo`\n"
         "  → Hoàn tác giao dịch cuối cùng\n"
         "  → Xóa dòng cuối cùng trong Sheet\n\n"
@@ -1103,6 +1348,96 @@ def get_monthly_data() -> pd.DataFrame:
         raise
 
 
+async def pay_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Xử lý lệnh /pay hoặc /qr - Tạo mã QR chuyển khoản nhanh VietQR"""
+    logger.info(f"📨 Nhận lệnh /pay từ user: {update.effective_user.id}")
+    
+    try:
+        if not context.args or len(context.args) < 1:
+            response = (
+                "⚠️ **Sai cú pháp!**\n\n"
+                "💡 **Cách sử dụng:**\n"
+                "• `/pay 50k trả tiền cơm`\n"
+                "• `/pay 100k tiền cafe`\n"
+                "• `/pay 500k` (không có nội dung)\n\n"
+                "**Ví dụ:**\n"
+                "• `/pay 50k trả tiền cơm`\n"
+                "• `/pay 1tr tiền nhà`"
+            )
+            await update.message.reply_text(response, parse_mode=ParseMode.MARKDOWN)
+            return
+        
+        # Parse số tiền từ argument đầu tiên
+        amount_text = context.args[0]
+        
+        # Sử dụng hàm parse_amount_for_split để parse số tiền
+        amount = parse_amount_for_split(amount_text)
+        
+        if amount == 0:
+            response = (
+                "❌ **Không tìm thấy số tiền hợp lệ!**\n\n"
+                "💡 Định dạng số tiền:\n"
+                "• `50k`, `100ng`, `500000`, `1tr`"
+            )
+            await update.message.reply_text(response, parse_mode=ParseMode.MARKDOWN)
+            return
+        
+        # Lấy nội dung chuyển khoản (tất cả arguments còn lại)
+        content = " ".join(context.args[1:]) if len(context.args) > 1 else ""
+        
+        logger.info(f"💰 Số tiền: {amount:,}đ")
+        logger.info(f"📝 Nội dung: '{content}'")
+        
+        # Tạo URL VietQR
+        qr_url = generate_vietqr_url(amount, content)
+        
+        if not qr_url:
+            await update.message.reply_text(
+                "❌ Không thể tạo mã QR. Vui lòng thử lại sau."
+            )
+            return
+        
+        # Tải ảnh QR từ URL
+        try:
+            img_response = requests.get(qr_url, timeout=10)
+            if img_response.status_code == 200:
+                image_buffer = io.BytesIO(img_response.content)
+                image_buffer.seek(0)
+                
+                # Tạo caption
+                caption = (
+                    f"💳 **Quét mã này bank cho sếp Lộc nha!**\n"
+                    f"💰 **Số tiền:** {amount:,}đ\n"
+                    f"🏦 **VPBank - 0375646013**\n"
+                    f"👤 **LE PHUOC LOC**"
+                )
+                if content:
+                    caption += f"\n📝 **Nội dung:** {content}"
+                
+                # Gửi ảnh QR code
+                await update.message.reply_photo(
+                    photo=image_buffer,
+                    caption=caption,
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                logger.info("✅ Đã gửi mã QR VietQR cho user")
+            else:
+                await update.message.reply_text(
+                    f"❌ Không thể tải ảnh QR (HTTP {img_response.status_code})"
+                )
+        except Exception as e:
+            logger.error(f"❌ Lỗi tải ảnh QR: {e}", exc_info=True)
+            await update.message.reply_text(
+                "❌ Không thể tải ảnh QR. Vui lòng thử lại sau."
+            )
+        
+    except Exception as e:
+        logger.error(f"❌ Lỗi xử lý lệnh /pay: {e}", exc_info=True)
+        await update.message.reply_text(
+            "❌ Đã xảy ra lỗi khi tạo mã QR. Vui lòng thử lại sau."
+        )
+
+
 async def chart_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Xử lý lệnh /chart - Vẽ biểu đồ tròn chi tiêu"""
     logger.info(f"📨 Nhận lệnh /chart từ user: {update.effective_user.id}")
@@ -1275,6 +1610,8 @@ async def export_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Xử lý tin nhắn từ user - Multi-Line Parsing"""
+    global groq_disabled  # Khai báo global ở đầu hàm
+    
     user_text = update.message.text
     user_id = update.effective_user.id
     
@@ -1286,8 +1623,182 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info("-" * 60)
     
     try:
-        # Parse nhiều món
+        # Hybrid AI + Fallback: Thử dùng Groq AI trước, nếu lỗi thì dùng Regex
+        groq_result = None
+        
+        # Lấy financial context
+        context_data = get_financial_context()
+        
+        # Ưu tiên Groq: Chỉ thử Groq nếu client khả dụng, chưa bị disable, và ưu tiên Groq
+        if groq_client and not groq_disabled and GROQ_PRIORITY:
+            try:
+                logger.info("🤖 Đang thử parse bằng Groq AI...")
+                groq_result = parse_with_groq(user_text, context_data, input_type='text')
+                logger.info("✅ Đã sử dụng Groq AI thành công")
+            except Exception as e:
+                error_str = str(e).lower()
+                # Log chi tiết hơn cho lỗi quota
+                if 'quota' in error_str or 'rate limit' in error_str or '429' in error_str:
+                    logger.warning("=" * 60)
+                    logger.warning("⚠️ GROQ QUOTA HẾT - TỰ ĐỘNG CHUYỂN SANG REGEX")
+                    logger.warning("💡 Bot vẫn sẽ thử Groq ở lần tiếp theo (quota có thể reset)")
+                    logger.warning("💡 Kiểm tra quota: https://console.groq.com/usage")
+                    logger.warning("=" * 60)
+                else:
+                    logger.warning(f"⚠️ Groq AI thất bại: {e}")
+                logger.info("🔄 Chuyển sang Regex Fallback...")
+                groq_result = None
+        elif groq_disabled:
+            # Groq đã bị disable (nếu có), bỏ qua luôn
+            logger.info("ℹ️ Groq đã bị tắt tạm thời. Sử dụng Regex...")
+            groq_result = None
+        
+        # Xử lý kết quả từ Groq
+        if groq_result:
+            if groq_result['type'] == 'chat':
+                # Chat mode: Chỉ trả lời, không lưu Sheet
+                await update.message.reply_text(groq_result['response'], parse_mode=ParseMode.MARKDOWN)
+                logger.info("✅ Đã gửi phản hồi chat cho user")
+                logger.info("=" * 60)
+                logger.info("✅ XỬ LÝ TIN NHẮN THÀNH CÔNG!")
+                logger.info("=" * 60)
+                return
+            elif groq_result['type'] == 'expense':
+                # Expense mode: Lưu vào Sheet và trả lời
+                expenses = groq_result['expenses']
+                ai_message = groq_result.get('message', '')
+                
+                # Lưu vào Sheet
+                saved_expenses = save_expenses_to_sheet(expenses)
+                
+                # Tính toán chi tiêu tuần
+                weekly_data = calculate_weekly_spend()
+                week_total = weekly_data['total']
+                remaining = weekly_data['remaining']
+                percentage = weekly_data['percentage']
+                current_weekday = datetime.now().weekday()  # 0=Monday, 6=Sunday
+                
+                # Tạo phản hồi đẹp
+                if len(saved_expenses) == 1:
+                    expense = saved_expenses[0]
+                    response = f"✅ **Đã lưu:**\n"
+                    response += f"• {expense['item']}: {expense['amount']:,}đ ({expense['category']})"
+                else:
+                    response = f"✅ **Đã lưu {len(saved_expenses)} khoản chi:**\n"
+                    total = 0
+                    for expense in saved_expenses:
+                        response += f"• {expense['item']}: {expense['amount']:,}đ ({expense['category']})\n"
+                        total += expense['amount']
+                    response += f"\n💰 **Tổng cộng: {total:,}đ**"
+                
+                # Thêm message từ AI nếu có
+                if ai_message:
+                    response += f"\n\n💬 {ai_message}"
+                
+                # Thêm thông tin ngân sách tuần
+                response += f"\n\n📊 **Tuần này:** {week_total:,}đ / {WEEKLY_LIMIT:,}đ"
+                
+                if remaining < 0:
+                    # Đã lố ngân sách
+                    over_budget = abs(remaining)
+                    response += f"\n⚠️ **BÁO ĐỘNG:** Bạn đã tiêu lố {over_budget:,}đ so với định mức tuần!"
+                else:
+                    response += f" (Còn dư: {remaining:,}đ)"
+                
+                # Cảnh báo thông minh: Nếu tiêu quá 80% và mới Thứ 3 hoặc Thứ 4
+                if percentage >= 80 and current_weekday <= 3:  # Monday=0, Tuesday=1, Wednesday=2, Thursday=3
+                    day_names = ['Thứ 2', 'Thứ 3', 'Thứ 4', 'Thứ 5', 'Thứ 6', 'Thứ 7', 'Chủ Nhật']
+                    current_day_name = day_names[current_weekday]
+                    response += f"\n\n⚠️ **Cảnh báo:** Tiêu chậm thôi, mới {current_day_name} đấy! ({percentage:.1f}% đã dùng)"
+                
+                # Kiểm tra từ khóa lãng phí và thêm cảnh báo
+                for expense in saved_expenses:
+                    wasteful_warning = get_wasteful_warning(expense['item'])
+                    if wasteful_warning:
+                        response += f"\n\n🚨 {wasteful_warning}"
+                        break  # Chỉ thêm 1 cảnh báo cho mỗi lần lưu
+                
+                await update.message.reply_text(response, parse_mode=ParseMode.MARKDOWN)
+                logger.info("✅ Đã gửi phản hồi expense cho user")
+                logger.info("=" * 60)
+                logger.info("✅ XỬ LÝ TIN NHẮN THÀNH CÔNG!")
+                logger.info("=" * 60)
+                return
+        
+        # Fallback về Regex nếu AI không khả dụng hoặc lỗi
+        # Kiểm tra xem có phải yêu cầu tạo QR không (pattern matching)
+        qr_keywords = ['mã qr', 'qr code', 'mã chuyển khoản', 'tạo qr', 'qr', 'chuyển khoản']
+        text_lower = user_text.lower()
+        
+        if any(keyword in text_lower for keyword in qr_keywords):
+            # Có từ khóa QR, thử parse số tiền và nội dung
+            logger.info("🔄 Phát hiện yêu cầu tạo QR (Regex Fallback)...")
+            
+            # Parse số tiền
+            amount = parse_amount_for_split(user_text)
+            
+            if amount > 0:
+                # Tìm nội dung (text sau số tiền)
+                import re
+                # Tìm pattern số tiền và lấy text sau đó
+                amount_pattern = r'(\d+(?:\.\d+)?)\s*(?:k|ng|nghìn|tr|triệu|đ|d)'
+                match = re.search(amount_pattern, text_lower)
+                
+                content = ""
+                if match:
+                    # Lấy text sau số tiền
+                    end_pos = match.end()
+                    remaining_text = user_text[end_pos:].strip()
+                    # Loại bỏ các từ khóa không cần thiết
+                    remaining_text = re.sub(r'\b(tạo|cho|tôi|cái|mã|qr|code|chuyển|khoản|mệnh|giá|nội|dung|là)\b', '', remaining_text, flags=re.IGNORECASE).strip()
+                    if remaining_text:
+                        content = remaining_text
+                
+                logger.info(f"💳 Regex parse QR: {amount:,}đ - '{content}'")
+                
+                # Tạo URL VietQR
+                qr_url = generate_vietqr_url(amount, content)
+                
+                if qr_url:
+                    try:
+                        img_response = requests.get(qr_url, timeout=10)
+                        if img_response.status_code == 200:
+                            image_buffer = io.BytesIO(img_response.content)
+                            image_buffer.seek(0)
+                            
+                            # Tạo caption
+                            caption = (
+                                f"💳 **Quét mã này bank cho sếp Lộc nha!**\n"
+                                f"💰 **Số tiền:** {amount:,}đ\n"
+                                f"🏦 **VPBank - 0375646013**\n"
+                                f"👤 **LE PHUOC LOC**"
+                            )
+                            if content:
+                                caption += f"\n📝 **Nội dung:** {content}"
+                            
+                            # Gửi ảnh QR code
+                            await update.message.reply_photo(
+                                photo=image_buffer,
+                                caption=caption,
+                                parse_mode=ParseMode.MARKDOWN
+                            )
+                            logger.info("✅ Đã gửi mã QR VietQR (Regex Fallback)")
+                            
+                            # Lưu vào memory
+                            add_to_memory(user_id, 'user', user_text)
+                            add_to_memory(user_id, 'bot', f"Đã tạo mã QR {amount:,}đ")
+                            
+                            logger.info("=" * 60)
+                            logger.info("✅ XỬ LÝ TIN NHẮN THÀNH CÔNG!")
+                            logger.info("=" * 60)
+                            return
+                    except Exception as e:
+                        logger.error(f"❌ Lỗi tải ảnh QR: {e}", exc_info=True)
+        
+        # Fallback về Regex cho chi tiêu
+        logger.info("🔄 Sử dụng Regex Fallback cho chi tiêu...")
         expenses = parse_multiple_items(user_text)
+        logger.info("✅ Đã sử dụng Regex Parsing (Fallback)")
         
         # Lưu vào Sheet
         saved_expenses = save_expenses_to_sheet(expenses)
@@ -1347,15 +1858,40 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.warning("⚠️ XỬ LÝ TIN NHẮN THẤT BẠI")
         logger.warning(f"📝 Lỗi: {error_str}")
         
-        error_msg = (
-            "❌ Em không hiểu, vui lòng nhập kiểu:\n"
-            "• `Món ăn + số tiền`\n"
-            "• `cơm 35k, trà 5k`\n\n"
-            "Ví dụ:\n"
-            "• `phở 50k`\n"
-            "• `xăng 200k`\n"
-            "• `cơm 35k, trà đá 5k`"
-        )
+        user_text_lower = user_text.lower().strip()
+        
+        # Phát hiện tin nhắn chào hỏi/thường
+        greetings = ['alo', 'hello', 'hi', 'xin chào', 'chào', 'chao', 'hey', 'hế lô', 'he lo']
+        is_greeting = any(greeting in user_text_lower for greeting in greetings)
+        
+        if is_greeting:
+            # Trả lời thân thiện cho tin nhắn chào hỏi
+            error_msg = (
+                "👋 **Xin chào!**\n\n"
+                "Tôi là bot quản lý chi tiêu của bạn! 💰\n\n"
+                "📝 **Để thêm chi tiêu, hãy nhập:**\n"
+                "• `phở 50k`\n"
+                "• `cơm 35k, trà đá 5k`\n"
+                "• `xăng 200k`\n\n"
+                "💡 **Các lệnh khác:**\n"
+                "• `/help` - Xem hướng dẫn đầy đủ\n"
+                "• `/report` - Xem báo cáo chi tiêu\n"
+                "• `/chart` - Xem biểu đồ\n"
+                "• `/remind 21:30` - Đặt báo thức nhắc nhở"
+            )
+        else:
+            # Tin nhắn không phải chào hỏi nhưng không parse được
+            error_msg = (
+                "❌ Em không hiểu, vui lòng nhập kiểu:\n"
+                "• `Món ăn + số tiền`\n"
+                "• `cơm 35k, trà 5k`\n\n"
+                "**Ví dụ:**\n"
+                "• `phở 50k`\n"
+                "• `xăng 200k`\n"
+                "• `cơm 35k, trà đá 5k`\n\n"
+                "💡 Gõ `/help` để xem hướng dẫn đầy đủ"
+            )
+        
         await update.message.reply_text(error_msg, parse_mode=ParseMode.MARKDOWN)
         
     except Exception as e:
@@ -1366,6 +1902,796 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         error_msg = "❌ Đã xảy ra lỗi. Vui lòng thử lại sau."
         await update.message.reply_text(error_msg)
+
+
+# ==================== XỬ LÝ VOICE (SPEECH-TO-TEXT) ====================
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Xử lý tin nhắn thoại - Chuyển giọng nói thành text"""
+    global groq_disabled
+    
+    logger.info("=" * 60)
+    logger.info("🎤 NHẬN TIN NHẮN THOẠI")
+    logger.info("=" * 60)
+    logger.info(f"👤 User ID: {update.effective_user.id}")
+    
+    try:
+        voice = update.message.voice
+        if not voice:
+            await update.message.reply_text("❌ Không tìm thấy file audio.")
+            return
+        
+        logger.info(f"📊 Voice file: {voice.duration}s, {voice.file_size} bytes")
+        
+        # Tải file về bộ nhớ đệm
+        file = await context.bot.get_file(voice.file_id)
+        voice_buffer = io.BytesIO()
+        await file.download_to_memory(voice_buffer)
+        voice_buffer.seek(0)
+        
+        logger.info("🔄 Đang chuyển đổi giọng nói thành text...")
+        
+        # Gửi lên Groq Whisper API
+        if groq_client and not groq_disabled:
+            try:
+                voice_buffer.seek(0)
+                
+                # Gọi Groq Audio Transcription API
+                logger.info("📤 Đang gửi audio lên Groq Whisper...")
+                transcription = groq_client.audio.transcriptions.create(
+                    file=('voice.m4a', voice_buffer, 'audio/m4a'),
+                    model='whisper-large-v3',
+                    response_format='json',
+                    language='vi'
+                )
+                
+                # Lấy text từ response
+                text = transcription.text
+                logger.info(f"🎤 Voice Text: '{text}'")
+                
+                if not text or not text.strip():
+                    await update.message.reply_text(
+                        "⚠️ Không thể nhận diện giọng nói.\n"
+                        "💡 Vui lòng thử lại hoặc gửi tin nhắn text."
+                    )
+                    return
+                
+                # Thông báo đã nghe được
+                await update.message.reply_text(f"🎤 Đã nghe: {text}")
+                logger.info("🔄 Chuyển sang xử lý text...")
+                
+                # Lấy financial context
+                context_data = get_financial_context()
+                
+                # Lấy chat history của user
+                user_id = update.effective_user.id
+                chat_history = format_chat_history(user_id)
+                if chat_history:
+                    logger.info(f"📚 Đã lấy chat history: {len(chat_history)} ký tự")
+                
+                # Gọi parse_with_groq với text đã chuyển đổi
+                groq_result = parse_with_groq(text, context_data, input_type='text', chat_history=chat_history)
+                
+                # Xử lý kết quả từ Groq (giống như handle_text)
+                if groq_result['type'] == 'chat':
+                    # Chat mode: Trả lời bằng VOICE
+                    bot_response = groq_result['response']
+                    
+                    # Gửi text response trước (để user biết bot đã hiểu)
+                    await update.message.reply_text(f"🎤 Đã nghe: {text}\n\n💬 {bot_response}", parse_mode=ParseMode.MARKDOWN)
+                    
+                    # Tạo và gửi voice reply
+                    if TTS_AVAILABLE:
+                        try:
+                            logger.info("🔊 Đang tạo voice reply...")
+                            
+                            # Tạo file âm thanh từ text
+                            tts = gTTS(text=bot_response, lang='vi', slow=False)
+                            
+                            # Lưu vào file tạm
+                            with tempfile.NamedTemporaryFile(delete=False, suffix='.mp3') as tmp_file:
+                                tts.save(tmp_file.name)
+                                
+                                # Chuyển đổi MP3 sang OGG (Telegram yêu cầu)
+                                audio = AudioSegment.from_mp3(tmp_file.name)
+                                
+                                # Lưu OGG vào buffer
+                                ogg_buffer = io.BytesIO()
+                                audio.export(ogg_buffer, format='ogg')
+                                ogg_buffer.seek(0)
+                                
+                                # Gửi voice message
+                                await update.message.reply_voice(voice=ogg_buffer)
+                                
+                                # Xóa file tạm
+                                os.unlink(tmp_file.name)
+                                
+                                logger.info("✅ Đã gửi voice reply cho user")
+                        except Exception as e:
+                            logger.warning(f"⚠️ Không thể tạo voice reply: {e}")
+                            # Nếu lỗi, vẫn gửi text như bình thường
+                    else:
+                        logger.info("ℹ️ TTS không khả dụng, chỉ gửi text")
+                    
+                    # Lưu vào memory: Câu hỏi (từ voice) và câu trả lời
+                    add_to_memory(user_id, 'user', text)
+                    add_to_memory(user_id, 'bot', bot_response)
+                    
+                    logger.info("✅ Đã gửi phản hồi chat cho user")
+                    return
+                elif groq_result['type'] == 'expense':
+                    # Expense mode: Lưu vào Sheet và trả lời
+                    expenses = groq_result['expenses']
+                    ai_message = groq_result.get('message', '')
+                    
+                    # Lưu vào Sheet
+                    saved_expenses = save_expenses_to_sheet(expenses)
+                    
+                    # Tính toán chi tiêu tuần
+                    weekly_data = calculate_weekly_spend()
+                    week_total = weekly_data['total']
+                    remaining = weekly_data['remaining']
+                    percentage = weekly_data['percentage']
+                    current_weekday = datetime.now().weekday()
+                    
+                    # Tạo phản hồi
+                    if len(saved_expenses) == 1:
+                        expense = saved_expenses[0]
+                        response = f"✅ **Đã lưu từ voice:**\n"
+                        response += f"• {expense['item']}: {expense['amount']:,}đ ({expense['category']})"
+                    else:
+                        response = f"✅ **Đã lưu {len(saved_expenses)} khoản chi từ voice:**\n"
+                        total = 0
+                        for expense in saved_expenses:
+                            response += f"• {expense['item']}: {expense['amount']:,}đ ({expense['category']})\n"
+                            total += expense['amount']
+                        response += f"\n💰 **Tổng cộng: {total:,}đ**"
+                    
+                    if ai_message:
+                        response += f"\n\n💬 {ai_message}"
+                    
+                    response += f"\n\n📊 **Tuần này:** {week_total:,}đ / {WEEKLY_LIMIT:,}đ"
+                    if remaining < 0:
+                        over_budget = abs(remaining)
+                        response += f"\n⚠️ **BÁO ĐỘNG:** Bạn đã tiêu lố {over_budget:,}đ so với định mức tuần!"
+                    else:
+                        response += f" (Còn dư: {remaining:,}đ)"
+                    
+                    # Cảnh báo thông minh
+                    if percentage >= 80 and current_weekday <= 3:
+                        day_names = ['Thứ 2', 'Thứ 3', 'Thứ 4', 'Thứ 5', 'Thứ 6', 'Thứ 7', 'Chủ Nhật']
+                        current_day_name = day_names[current_weekday]
+                        response += f"\n\n⚠️ **Cảnh báo:** Tiêu chậm thôi, mới {current_day_name} đấy! ({percentage:.1f}% đã dùng)"
+                    
+                    # Kiểm tra từ khóa lãng phí
+                    for expense in saved_expenses:
+                        wasteful_warning = get_wasteful_warning(expense['item'])
+                        if wasteful_warning:
+                            response += f"\n\n🚨 {wasteful_warning}"
+                            break
+                    
+                    # Gửi text response trước
+                    await update.message.reply_text(response, parse_mode=ParseMode.MARKDOWN)
+                    
+                    # Tạo và gửi voice reply
+                    if TTS_AVAILABLE:
+                        try:
+                            logger.info("🔊 Đang tạo voice reply cho expense...")
+                            
+                            # Tạo text ngắn gọn cho voice
+                            voice_text = f"Đã lưu {len(saved_expenses)} khoản chi"
+                            if len(saved_expenses) == 1:
+                                voice_text = f"Đã lưu {saved_expenses[0]['item']} {saved_expenses[0]['amount']:,}đ"
+                            
+                            # Tạo file âm thanh
+                            tts = gTTS(text=voice_text, lang='vi', slow=False)
+                            
+                            # Lưu vào file tạm
+                            with tempfile.NamedTemporaryFile(delete=False, suffix='.mp3') as tmp_file:
+                                tts.save(tmp_file.name)
+                                
+                                # Chuyển đổi MP3 sang OGG
+                                audio = AudioSegment.from_mp3(tmp_file.name)
+                                
+                                # Lưu OGG vào buffer
+                                ogg_buffer = io.BytesIO()
+                                audio.export(ogg_buffer, format='ogg')
+                                ogg_buffer.seek(0)
+                                
+                                # Gửi voice message
+                                await update.message.reply_voice(voice=ogg_buffer)
+                                
+                                # Xóa file tạm
+                                os.unlink(tmp_file.name)
+                                
+                                logger.info("✅ Đã gửi voice reply cho expense")
+                        except Exception as e:
+                            logger.warning(f"⚠️ Không thể tạo voice reply: {e}")
+                    
+                    # Lưu vào memory: Câu hỏi (từ voice) và câu trả lời
+                    add_to_memory(user_id, 'user', text)
+                    add_to_memory(user_id, 'bot', response)
+                    
+                    logger.info("✅ Đã xử lý voice thành công")
+                    return
+                
+            except Exception as e:
+                logger.error(f"❌ Lỗi Groq Whisper: {e}", exc_info=True)
+                await update.message.reply_text(
+                    "⚠️ Không thể chuyển đổi giọng nói.\n"
+                    "💡 Vui lòng thử lại hoặc gửi tin nhắn text thay thế."
+                )
+                return
+        else:
+            await update.message.reply_text(
+                "⚠️ Groq AI chưa được kích hoạt.\n"
+                "💡 Vui lòng gửi tin nhắn text thay thế."
+            )
+            return
+        
+    except Exception as e:
+        logger.error(f"❌ Lỗi xử lý voice: {e}", exc_info=True)
+        await update.message.reply_text("❌ Đã xảy ra lỗi khi xử lý tin nhắn thoại.")
+
+
+# ==================== XỬ LÝ PHOTO (VISION) ====================
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Xử lý ảnh - Trích xuất chi tiêu từ hóa đơn/menu"""
+    global groq_disabled
+    
+    logger.info("=" * 60)
+    logger.info("📷 NHẬN ẢNH")
+    logger.info("=" * 60)
+    logger.info(f"👤 User ID: {update.effective_user.id}")
+    
+    try:
+        photo = update.message.photo
+        if not photo:
+            await update.message.reply_text("❌ Không tìm thấy ảnh.")
+            return
+        
+        # Lấy ảnh có độ phân giải cao nhất (cuối cùng trong list)
+        photo_file = photo[-1]
+        logger.info(f"📊 Photo: {photo_file.width}x{photo_file.height}, {photo_file.file_size} bytes")
+        
+        # Tải ảnh về bộ nhớ đệm
+        file = await context.bot.get_file(photo_file.file_id)
+        image_buffer = io.BytesIO()
+        await file.download_to_memory(image_buffer)
+        image_buffer.seek(0)
+        
+        # Mã hóa ảnh sang Base64
+        image_base64 = base64.b64encode(image_buffer.read()).decode('utf-8')
+        logger.info("🔄 Đang gửi ảnh lên Groq Vision...")
+        
+        # Lấy financial context
+        context_data = get_financial_context()
+        
+        # Gửi lên Groq Vision
+        if groq_client and not groq_disabled:
+            try:
+                groq_result = parse_with_groq(image_base64, context_data, input_type='image')
+                
+                # Kiểm tra nếu là lỗi Vision (đã được xử lý trong parse_with_groq)
+                if groq_result.get('type') == 'chat' and 'bảo trì' in groq_result.get('response', ''):
+                    await update.message.reply_text(groq_result['response'], parse_mode=ParseMode.MARKDOWN)
+                    logger.info("⚠️ Vision Model bảo trì - Đã thông báo user")
+                    return
+                
+                # Xử lý kết quả
+                if groq_result['type'] == 'expense':
+                    expenses = groq_result['expenses']
+                    ai_message = groq_result.get('message', '')
+                    
+                    # Lưu vào Sheet
+                    saved_expenses = save_expenses_to_sheet(expenses)
+                    
+                    # Tính toán chi tiêu tuần
+                    weekly_data = calculate_weekly_spend()
+                    week_total = weekly_data['total']
+                    remaining = weekly_data['remaining']
+                    
+                    # Tạo phản hồi
+                    if len(saved_expenses) == 1:
+                        expense = saved_expenses[0]
+                        response = f"✅ **Đã lưu từ ảnh:**\n"
+                        response += f"• {expense['item']}: {expense['amount']:,}đ ({expense['category']})"
+                    else:
+                        response = f"✅ **Đã lưu {len(saved_expenses)} khoản chi từ ảnh:**\n"
+                        total = 0
+                        for expense in saved_expenses:
+                            response += f"• {expense['item']}: {expense['amount']:,}đ ({expense['category']})\n"
+                            total += expense['amount']
+                        response += f"\n💰 **Tổng cộng: {total:,}đ**"
+                    
+                    if ai_message:
+                        response += f"\n\n💬 {ai_message}"
+                    
+                    response += f"\n\n📊 **Tuần này:** {week_total:,}đ / {WEEKLY_LIMIT:,}đ"
+                    if remaining < 0:
+                        response += f"\n⚠️ **Đã vượt quá:** {abs(remaining):,}đ"
+                    else:
+                        response += f" (Còn dư: {remaining:,}đ)"
+                    
+                    await update.message.reply_text(response, parse_mode=ParseMode.MARKDOWN)
+                    logger.info("✅ Đã xử lý ảnh thành công")
+                    
+                elif groq_result['type'] == 'chat':
+                    await update.message.reply_text(groq_result['response'], parse_mode=ParseMode.MARKDOWN)
+                    
+            except Exception as e:
+                error_str = str(e).lower()
+                error_code = getattr(e, 'status_code', None)
+                
+                # Kiểm tra lỗi BadRequest (400) hoặc model decommissioned
+                if (
+                    '400' in str(e) or 
+                    'bad request' in error_str or 
+                    'decommissioned' in error_str or
+                    'not found' in error_str or
+                    error_code == 400
+                ):
+                    logger.warning("=" * 60)
+                    logger.warning("⚠️ Vision Model đang bảo trì hoặc bị đổi tên")
+                    logger.warning(f"⚠️ Error: {e}")
+                    logger.warning("=" * 60)
+                    await update.message.reply_text(
+                        "❌ Tính năng đọc ảnh đang bảo trì do Groq thay đổi Model.\n"
+                        "💡 Vui lòng nhập tay nhé sếp!"
+                    )
+                else:
+                    logger.error(f"❌ Lỗi xử lý ảnh với Groq: {e}", exc_info=True)
+                    await update.message.reply_text(
+                        "❌ Không thể đọc thông tin từ ảnh.\n"
+                        "💡 Vui lòng gửi lại ảnh rõ hơn hoặc nhập text thay thế."
+                    )
+        else:
+            await update.message.reply_text(
+                "⚠️ Groq Vision chưa được kích hoạt.\n"
+                "💡 Vui lòng nhập text thay thế."
+            )
+        
+    except Exception as e:
+        logger.error(f"❌ Lỗi xử lý photo: {e}", exc_info=True)
+        await update.message.reply_text("❌ Đã xảy ra lỗi khi xử lý ảnh.")
+
+
+# ==================== XỬ LÝ TEXT (TÁCH RA TỪ HANDLE_MESSAGE) ====================
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Xử lý tin nhắn text - Tách ra từ handle_message"""
+    global groq_disabled
+    
+    user_text = update.message.text
+    user_id = update.effective_user.id
+    
+    logger.info("=" * 60)
+    logger.info("📨 NHẬN TIN NHẮN TEXT")
+    logger.info("=" * 60)
+    logger.info(f"👤 User ID: {user_id}")
+    logger.info(f"💬 Tin nhắn: '{user_text}'")
+    logger.info("-" * 60)
+    
+    try:
+        # Lấy financial context
+        context_data = get_financial_context()
+        
+        # Lấy chat history của user
+        chat_history = format_chat_history(user_id)
+        if chat_history:
+            logger.info(f"📚 Đã lấy chat history: {len(chat_history)} ký tự")
+        
+        # Hybrid AI + Fallback: Thử dùng Groq AI trước, nếu lỗi thì dùng Regex
+        groq_result = None
+        
+        # Ưu tiên Groq: Chỉ thử Groq nếu client khả dụng, chưa bị disable, và ưu tiên Groq
+        if groq_client and not groq_disabled and GROQ_PRIORITY:
+            try:
+                logger.info("🤖 Đang thử parse bằng Groq AI...")
+                groq_result = parse_with_groq(user_text, context_data, input_type='text', chat_history=chat_history)
+                logger.info("✅ Đã sử dụng Groq AI thành công")
+            except Exception as e:
+                error_str = str(e).lower()
+                # Log chi tiết hơn cho lỗi quota
+                if 'quota' in error_str or 'rate limit' in error_str or '429' in error_str:
+                    logger.warning("=" * 60)
+                    logger.warning("⚠️ GROQ QUOTA HẾT - TỰ ĐỘNG CHUYỂN SANG REGEX")
+                    logger.warning("💡 Bot vẫn sẽ thử Groq ở lần tiếp theo (quota có thể reset)")
+                    logger.warning("💡 Kiểm tra quota: https://console.groq.com/usage")
+                    logger.warning("=" * 60)
+                else:
+                    logger.warning(f"⚠️ Groq AI thất bại: {e}")
+                logger.info("🔄 Chuyển sang Regex Fallback...")
+                groq_result = None
+        elif groq_disabled:
+            # Groq đã bị disable (nếu có), bỏ qua luôn
+            logger.info("ℹ️ Groq đã bị tắt tạm thời. Sử dụng Regex...")
+            groq_result = None
+        
+        # Xử lý kết quả từ Groq
+        if groq_result:
+            if groq_result['type'] == 'qr_request':
+                # QR Request mode: Tạo mã QR chuyển khoản
+                amount = groq_result['amount']
+                content = groq_result.get('content', '')
+                
+                logger.info(f"💳 Tạo mã QR: {amount:,}đ - '{content}'")
+                
+                # Tạo URL VietQR
+                qr_url = generate_vietqr_url(amount, content)
+                
+                if not qr_url:
+                    await update.message.reply_text(
+                        "❌ Không thể tạo mã QR. Vui lòng thử lại sau."
+                    )
+                    return
+                
+                # Tải ảnh QR từ URL
+                try:
+                    img_response = requests.get(qr_url, timeout=10)
+                    if img_response.status_code == 200:
+                        image_buffer = io.BytesIO(img_response.content)
+                        image_buffer.seek(0)
+                        
+                        # Tạo caption
+                        caption = (
+                            f"💳 **Quét mã này bank cho sếp Lộc nha!**\n"
+                            f"💰 **Số tiền:** {amount:,}đ\n"
+                            f"🏦 **VPBank - 0375646013**\n"
+                            f"👤 **LE PHUOC LOC**"
+                        )
+                        if content:
+                            caption += f"\n📝 **Nội dung:** {content}"
+                        
+                        # Gửi ảnh QR code
+                        await update.message.reply_photo(
+                            photo=image_buffer,
+                            caption=caption,
+                            parse_mode=ParseMode.MARKDOWN
+                        )
+                        logger.info("✅ Đã gửi mã QR VietQR cho user")
+                        
+                        # Lưu vào memory
+                        add_to_memory(user_id, 'user', user_text)
+                        add_to_memory(user_id, 'bot', f"Đã tạo mã QR {amount:,}đ")
+                        
+                        logger.info("=" * 60)
+                        logger.info("✅ XỬ LÝ TIN NHẮN THÀNH CÔNG!")
+                        logger.info("=" * 60)
+                        return
+                    else:
+                        await update.message.reply_text(
+                            f"❌ Không thể tải ảnh QR (HTTP {img_response.status_code})"
+                        )
+                        return
+                except Exception as e:
+                    logger.error(f"❌ Lỗi tải ảnh QR: {e}", exc_info=True)
+                    await update.message.reply_text(
+                        "❌ Không thể tải ảnh QR. Vui lòng thử lại sau."
+                    )
+                    return
+                    
+            elif groq_result['type'] == 'search':
+                # Search mode: Tìm kiếm Google và trả lời
+                search_query = groq_result.get('query', '')
+                if not search_query:
+                    # Nếu không có query, trả lời như chat
+                    await update.message.reply_text(
+                        "⚠️ Không thể xác định từ khóa tìm kiếm.\n"
+                        "💡 Vui lòng thử lại với câu hỏi cụ thể hơn."
+                    )
+                    return
+                
+                logger.info(f"🔍 AI yêu cầu tìm kiếm: '{search_query}'")
+                
+                # Gọi Google Search
+                try:
+                    search_results = google_search(search_query, num_results=5)
+                    
+                    if not search_results or "⚠️" in search_results:
+                        # Lỗi search hoặc không có kết quả
+                        await update.message.reply_text(
+                            f"❌ {search_results if search_results else 'Không thể tìm kiếm. Vui lòng thử lại sau.'}"
+                        )
+                        return
+                    
+                    # Gửi kết quả tìm kiếm lên Groq lần thứ 2 để tổng hợp
+                    logger.info("🤖 Đang gửi kết quả tìm kiếm lên Groq để tổng hợp...")
+                    
+                    synthesis_prompt = (
+                        f"Đây là kết quả tìm kiếm từ Google cho câu hỏi: '{user_text}'\n\n"
+                        f"KẾT QUẢ TÌM KIẾM:\n{search_results}\n\n"
+                        f"Hãy trả lời câu hỏi ban đầu của user dựa trên thông tin tìm kiếm này. "
+                        f"Trả lời ngắn gọn, chính xác, có thể tham khảo các link trong kết quả. "
+                        f"Trả về JSON: {{\"type\": \"chat\", \"response\": \"Câu trả lời dựa trên kết quả tìm kiếm...\"}}"
+                    )
+                    
+                    final_result = parse_with_groq(synthesis_prompt, "", input_type='text', chat_history="")
+                    
+                    if final_result.get('type') == 'chat':
+                        bot_response = final_result.get('response', 'Không thể tổng hợp kết quả.')
+                        await update.message.reply_text(bot_response, parse_mode=ParseMode.MARKDOWN)
+                        
+                        # Lưu vào memory
+                        add_to_memory(user_id, 'user', user_text)
+                        add_to_memory(user_id, 'bot', bot_response)
+                        
+                        logger.info("✅ Đã gửi phản hồi search cho user")
+                        logger.info("=" * 60)
+                        logger.info("✅ XỬ LÝ TIN NHẮN THÀNH CÔNG!")
+                        logger.info("=" * 60)
+                        return
+                    else:
+                        # Fallback: Gửi kết quả search trực tiếp
+                        await update.message.reply_text(
+                            f"🔍 **Kết quả tìm kiếm:**\n\n{search_results}",
+                            parse_mode=ParseMode.MARKDOWN
+                        )
+                        add_to_memory(user_id, 'user', user_text)
+                        add_to_memory(user_id, 'bot', search_results)
+                        return
+                        
+                except Exception as e:
+                    logger.error(f"❌ Lỗi Google Search: {e}", exc_info=True)
+                    await update.message.reply_text(
+                        "⚠️ Không thể tìm kiếm lúc này.\n"
+                        "💡 Vui lòng thử lại sau hoặc kiểm tra cấu hình Google Search API."
+                    )
+                    return
+                    
+            elif groq_result['type'] == 'chat':
+                # Chat mode: Chỉ trả lời, không lưu Sheet
+                bot_response = groq_result['response']
+                await update.message.reply_text(bot_response, parse_mode=ParseMode.MARKDOWN)
+                
+                # Lưu vào memory: Câu hỏi và câu trả lời
+                add_to_memory(user_id, 'user', user_text)
+                add_to_memory(user_id, 'bot', bot_response)
+                
+                logger.info("✅ Đã gửi phản hồi chat cho user")
+                logger.info("=" * 60)
+                logger.info("✅ XỬ LÝ TIN NHẮN THÀNH CÔNG!")
+                logger.info("=" * 60)
+                return
+            elif groq_result['type'] == 'expense':
+                # Expense mode: Lưu vào Sheet và trả lời
+                expenses = groq_result['expenses']
+                ai_message = groq_result.get('message', '')
+                
+                # Lưu vào Sheet
+                saved_expenses = save_expenses_to_sheet(expenses)
+                
+                # Tính toán chi tiêu tuần
+                weekly_data = calculate_weekly_spend()
+                week_total = weekly_data['total']
+                remaining = weekly_data['remaining']
+                percentage = weekly_data['percentage']
+                current_weekday = datetime.now().weekday()  # 0=Monday, 6=Sunday
+                
+                # Tạo phản hồi đẹp
+                if len(saved_expenses) == 1:
+                    expense = saved_expenses[0]
+                    response = f"✅ **Đã lưu:**\n"
+                    response += f"• {expense['item']}: {expense['amount']:,}đ ({expense['category']})"
+                else:
+                    response = f"✅ **Đã lưu {len(saved_expenses)} khoản chi:**\n"
+                    total = 0
+                    for expense in saved_expenses:
+                        response += f"• {expense['item']}: {expense['amount']:,}đ ({expense['category']})\n"
+                        total += expense['amount']
+                    response += f"\n💰 **Tổng cộng: {total:,}đ**"
+                
+                # Thêm message từ AI nếu có
+                if ai_message:
+                    response += f"\n\n💬 {ai_message}"
+                
+                # Thêm thông tin ngân sách tuần
+                response += f"\n\n📊 **Tuần này:** {week_total:,}đ / {WEEKLY_LIMIT:,}đ"
+                
+                if remaining < 0:
+                    # Đã lố ngân sách
+                    over_budget = abs(remaining)
+                    response += f"\n⚠️ **BÁO ĐỘNG:** Bạn đã tiêu lố {over_budget:,}đ so với định mức tuần!"
+                else:
+                    response += f" (Còn dư: {remaining:,}đ)"
+                
+                # Cảnh báo thông minh: Nếu tiêu quá 80% và mới Thứ 3 hoặc Thứ 4
+                if percentage >= 80 and current_weekday <= 3:  # Monday=0, Tuesday=1, Wednesday=2, Thursday=3
+                    day_names = ['Thứ 2', 'Thứ 3', 'Thứ 4', 'Thứ 5', 'Thứ 6', 'Thứ 7', 'Chủ Nhật']
+                    current_day_name = day_names[current_weekday]
+                    response += f"\n\n⚠️ **Cảnh báo:** Tiêu chậm thôi, mới {current_day_name} đấy! ({percentage:.1f}% đã dùng)"
+                
+                # Kiểm tra từ khóa lãng phí và thêm cảnh báo
+                for expense in saved_expenses:
+                    wasteful_warning = get_wasteful_warning(expense['item'])
+                    if wasteful_warning:
+                        response += f"\n\n🚨 {wasteful_warning}"
+                        break  # Chỉ thêm 1 cảnh báo cho mỗi lần lưu
+                
+                await update.message.reply_text(response, parse_mode=ParseMode.MARKDOWN)
+                logger.info("✅ Đã gửi phản hồi expense cho user")
+                logger.info("=" * 60)
+                logger.info("✅ XỬ LÝ TIN NHẮN THÀNH CÔNG!")
+                logger.info("=" * 60)
+                return
+        
+        # Fallback về Regex nếu AI không khả dụng hoặc lỗi
+        # Kiểm tra xem có phải yêu cầu tạo QR không (pattern matching)
+        qr_keywords = ['mã qr', 'qr code', 'mã chuyển khoản', 'tạo qr', 'qr', 'chuyển khoản']
+        text_lower = user_text.lower()
+        
+        if any(keyword in text_lower for keyword in qr_keywords):
+            # Có từ khóa QR, thử parse số tiền và nội dung
+            logger.info("🔄 Phát hiện yêu cầu tạo QR (Regex Fallback)...")
+            
+            # Parse số tiền
+            amount = parse_amount_for_split(user_text)
+            
+            if amount > 0:
+                # Tìm nội dung (text sau số tiền)
+                import re
+                # Tìm pattern số tiền và lấy text sau đó
+                amount_pattern = r'(\d+(?:\.\d+)?)\s*(?:k|ng|nghìn|tr|triệu|đ|d)'
+                match = re.search(amount_pattern, text_lower)
+                
+                content = ""
+                if match:
+                    # Lấy text sau số tiền
+                    end_pos = match.end()
+                    remaining_text = user_text[end_pos:].strip()
+                    # Loại bỏ các từ khóa không cần thiết
+                    remaining_text = re.sub(r'\b(tạo|cho|tôi|cái|mã|qr|code|chuyển|khoản|mệnh|giá|nội|dung|là)\b', '', remaining_text, flags=re.IGNORECASE).strip()
+                    if remaining_text:
+                        content = remaining_text
+                
+                logger.info(f"💳 Regex parse QR: {amount:,}đ - '{content}'")
+                
+                # Tạo URL VietQR
+                qr_url = generate_vietqr_url(amount, content)
+                
+                if qr_url:
+                    try:
+                        img_response = requests.get(qr_url, timeout=10)
+                        if img_response.status_code == 200:
+                            image_buffer = io.BytesIO(img_response.content)
+                            image_buffer.seek(0)
+                            
+                            # Tạo caption
+                            caption = (
+                                f"💳 **Quét mã này bank cho sếp Lộc nha!**\n"
+                                f"💰 **Số tiền:** {amount:,}đ\n"
+                                f"🏦 **VPBank - 0375646013**\n"
+                                f"👤 **LE PHUOC LOC**"
+                            )
+                            if content:
+                                caption += f"\n📝 **Nội dung:** {content}"
+                            
+                            # Gửi ảnh QR code
+                            await update.message.reply_photo(
+                                photo=image_buffer,
+                                caption=caption,
+                                parse_mode=ParseMode.MARKDOWN
+                            )
+                            logger.info("✅ Đã gửi mã QR VietQR (Regex Fallback)")
+                            
+                            # Lưu vào memory
+                            add_to_memory(user_id, 'user', user_text)
+                            add_to_memory(user_id, 'bot', f"Đã tạo mã QR {amount:,}đ")
+                            
+                            logger.info("=" * 60)
+                            logger.info("✅ XỬ LÝ TIN NHẮN THÀNH CÔNG!")
+                            logger.info("=" * 60)
+                            return
+                    except Exception as e:
+                        logger.error(f"❌ Lỗi tải ảnh QR: {e}", exc_info=True)
+        
+        # Fallback về Regex cho chi tiêu
+        logger.info("🔄 Sử dụng Regex Fallback cho chi tiêu...")
+        expenses = parse_multiple_items(user_text)
+        logger.info("✅ Đã sử dụng Regex Parsing (Fallback)")
+        
+        # Lưu vào Sheet
+        saved_expenses = save_expenses_to_sheet(expenses)
+        
+        # Tính toán chi tiêu tuần
+        weekly_data = calculate_weekly_spend()
+        week_total = weekly_data['total']
+        remaining = weekly_data['remaining']
+        percentage = weekly_data['percentage']
+        current_weekday = datetime.now().weekday()  # 0=Monday, 6=Sunday
+        
+        # Tạo phản hồi đẹp
+        if len(saved_expenses) == 1:
+            expense = saved_expenses[0]
+            response = f"✅ **Đã lưu:**\n"
+            response += f"• {expense['item']}: {expense['amount']:,}đ ({expense['category']})"
+        else:
+            response = f"✅ **Đã lưu {len(saved_expenses)} khoản chi:**\n"
+            total = 0
+            for expense in saved_expenses:
+                response += f"• {expense['item']}: {expense['amount']:,}đ ({expense['category']})\n"
+                total += expense['amount']
+            response += f"\n💰 **Tổng cộng: {total:,}đ**"
+        
+        # Thêm thông tin ngân sách tuần
+        response += f"\n\n📊 **Tuần này:** {week_total:,}đ / {WEEKLY_LIMIT:,}đ"
+        
+        if remaining < 0:
+            # Đã lố ngân sách
+            over_budget = abs(remaining)
+            response += f"\n⚠️ **BÁO ĐỘNG:** Bạn đã tiêu lố {over_budget:,}đ so với định mức tuần!"
+        else:
+            response += f" (Còn dư: {remaining:,}đ)"
+        
+        # Cảnh báo thông minh: Nếu tiêu quá 80% và mới Thứ 3 hoặc Thứ 4
+        if percentage >= 80 and current_weekday <= 3:  # Monday=0, Tuesday=1, Wednesday=2, Thursday=3
+            day_names = ['Thứ 2', 'Thứ 3', 'Thứ 4', 'Thứ 5', 'Thứ 6', 'Thứ 7', 'Chủ Nhật']
+            current_day_name = day_names[current_weekday]
+            response += f"\n\n⚠️ **Cảnh báo:** Tiêu chậm thôi, mới {current_day_name} đấy! ({percentage:.1f}% đã dùng)"
+        
+        # Kiểm tra từ khóa lãng phí và thêm cảnh báo
+        for expense in saved_expenses:
+            wasteful_warning = get_wasteful_warning(expense['item'])
+            if wasteful_warning:
+                response += f"\n\n🚨 {wasteful_warning}"
+                break  # Chỉ thêm 1 cảnh báo cho mỗi lần lưu
+        
+        await update.message.reply_text(response, parse_mode=ParseMode.MARKDOWN)
+        
+    except ValueError as e:
+        error_str = str(e)
+        logger.warning("=" * 60)
+        logger.warning("⚠️ XỬ LÝ TIN NHẮN THẤT BẠI")
+        logger.warning(f"📝 Lỗi: {error_str}")
+        
+        user_text_lower = user_text.lower().strip()
+        
+        # Phát hiện tin nhắn chào hỏi/thường
+        greetings = ['alo', 'hello', 'hi', 'xin chào', 'chào', 'chao', 'hey', 'hế lô', 'he lo']
+        is_greeting = any(greeting in user_text_lower for greeting in greetings)
+        
+        if is_greeting:
+            # Trả lời thân thiện cho tin nhắn chào hỏi
+            error_msg = (
+                "👋 **Xin chào!**\n\n"
+                "Tôi là bot quản lý chi tiêu của bạn! 💰\n\n"
+                "📝 **Để thêm chi tiêu, hãy nhập:**\n"
+                "• `phở 50k`\n"
+                "• `cơm 35k, trà đá 5k`\n"
+                "• `xăng 200k`\n\n"
+                "💡 **Các lệnh khác:**\n"
+                "• `/help` - Xem hướng dẫn đầy đủ\n"
+                "• `/report` - Xem báo cáo chi tiêu\n"
+                "• `/chart` - Xem biểu đồ\n"
+                "• `/remind 21:30` - Đặt báo thức nhắc nhở"
+            )
+        else:
+            # Tin nhắn không phải chào hỏi nhưng không parse được
+            error_msg = (
+                "❌ Em không hiểu, vui lòng nhập kiểu:\n"
+                "• `Món ăn + số tiền`\n"
+                "• `cơm 35k, trà 5k`\n\n"
+                "**Ví dụ:**\n"
+                "• `phở 50k`\n"
+                "• `xăng 200k`\n"
+                "• `cơm 35k, trà đá 5k`\n\n"
+                "💡 Gõ `/help` để xem hướng dẫn đầy đủ"
+            )
+        
+        await update.message.reply_text(error_msg, parse_mode=ParseMode.MARKDOWN)
+        
+    except Exception as e:
+        logger.error("=" * 60)
+        logger.error("❌ XỬ LÝ TIN NHẮN THẤT BẠI (Exception)")
+        logger.error(f"📝 Lỗi: {e}")
+        logger.error(f"💡 Chi tiết:", exc_info=True)
+        
+        error_msg = "❌ Đã xảy ra lỗi. Vui lòng thử lại sau."
+        await update.message.reply_text(error_msg)
+
+
+# ==================== HANDLE MESSAGE (WRAPPER) ====================
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Wrapper để xử lý text messages"""
+    await handle_text(update, context)
 
 
 # ==================== HÀM CHÍNH ====================
@@ -1398,7 +2724,13 @@ def main():
     application.add_handler(CommandHandler("remind", remind_command))
     application.add_handler(CommandHandler("stopremind", stopremind_command))
     application.add_handler(CommandHandler("chia", chia_command))
+    application.add_handler(CommandHandler("pay", pay_command))
+    application.add_handler(CommandHandler("qr", pay_command))  # Alias cho /pay
+    
+    # Đăng ký handlers cho đa modal
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    application.add_handler(MessageHandler(filters.VOICE, handle_voice))
+    application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     
     # Khôi phục reminders và lên lịch jobs
     job_queue = application.job_queue
