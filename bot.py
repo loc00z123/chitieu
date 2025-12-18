@@ -2770,11 +2770,14 @@ def main():
     logger.info("💡 Enterprise Edition - Multi-Line, Charts, Excel Export Enabled")
     logger.info("=" * 60)
     
-    # Xử lý conflict với retry logic
+    # Xử lý lỗi với auto-recovery logic
+    import time
     max_retries = 3
     retry_delay = 5  # seconds
+    consecutive_failures = 0
+    max_consecutive_failures = 10  # Sau 10 lần fail liên tiếp thì dừng
     
-    for attempt in range(max_retries):
+    while True:  # Infinite loop để bot luôn tự động recover
         try:
             # Trước khi start polling, thử dừng các webhook cũ (nếu có)
             try:
@@ -2784,39 +2787,66 @@ def main():
             except Exception as webhook_error:
                 logger.debug(f"Không có webhook cũ để xóa: {webhook_error}")
             
+            # Reset counter nếu thành công
+            consecutive_failures = 0
+            retry_delay = 5  # Reset delay
+            
             # Start polling
-            logger.info(f"🔄 Đang khởi động polling... (Lần thử {attempt + 1}/{max_retries})")
+            logger.info("🔄 Đang khởi động polling...")
+            logger.info("💡 Bot sẽ tự động restart nếu gặp lỗi tạm thời")
             application.run_polling(
                 allowed_updates=Update.ALL_TYPES, 
                 drop_pending_updates=True,
                 close_loop=False
             )
-            break  # Nếu thành công, thoát khỏi vòng lặp
+            # Nếu polling dừng (không có lỗi), restart lại
+            logger.warning("⚠️ Polling đã dừng, đang restart...")
+            time.sleep(2)
             
+        except KeyboardInterrupt:
+            logger.info("🛑 Bot đã được dừng bởi user (Ctrl+C)")
+            break
         except Exception as e:
+            consecutive_failures += 1
             error_str = str(e)
-            if "Conflict" in error_str or "getUpdates" in error_str:
-                if attempt < max_retries - 1:
+            error_type = type(e).__name__
+            
+            # Kiểm tra nếu là lỗi có thể retry
+            retryable_errors = [
+                "Conflict", "getUpdates", "NetworkError", "TimedOut", 
+                "ConnectionError", "RetryAfter", "TelegramError"
+            ]
+            is_retryable = any(keyword in error_str or keyword in error_type for keyword in retryable_errors)
+            
+            if is_retryable:
+                if consecutive_failures < max_consecutive_failures:
                     logger.warning("=" * 60)
-                    logger.warning(f"⚠️ CONFLICT phát hiện! (Lần thử {attempt + 1}/{max_retries})")
-                    logger.warning("💡 Đang đợi và thử lại...")
+                    logger.warning(f"⚠️ Lỗi phát hiện: {error_type}")
+                    logger.warning(f"📝 Chi tiết: {error_str[:200]}")
+                    logger.warning(f"🔄 Tự động restart sau {retry_delay} giây... (Lần thử {consecutive_failures}/{max_consecutive_failures})")
                     logger.warning("=" * 60)
-                    import time
                     time.sleep(retry_delay)
-                    retry_delay *= 2  # Exponential backoff
+                    retry_delay = min(retry_delay * 1.5, 60)  # Exponential backoff, max 60s
                 else:
                     logger.critical("=" * 60)
-                    logger.critical("❌ CRITICAL ERROR: CONFLICT - NHIỀU INSTANCE BOT ĐANG CHẠY!")
+                    logger.critical(f"❌ CRITICAL: Đã fail {max_consecutive_failures} lần liên tiếp!")
+                    logger.critical(f"📝 Lỗi cuối: {error_type}: {error_str[:200]}")
+                    logger.critical("💡 Bot sẽ dừng. Vui lòng kiểm tra logs và restart thủ công.")
                     logger.critical("=" * 60)
-                    logger.critical("💡 GIẢI PHÁP:")
-                    logger.critical("   1. Kiểm tra xem có đang chạy bot local không (Ctrl+C để dừng)")
-                    logger.critical("   2. Trên Render: Vào Settings → Restart service")
-                    logger.critical("   3. Đợi 30 giây rồi thử lại")
-                    logger.critical("=" * 60)
-                    raise
+                    break
             else:
-                logger.critical(f"❌ Lỗi: {e}")
-                raise
+                # Lỗi không thể retry (như API key sai, syntax error, etc.)
+                logger.critical("=" * 60)
+                logger.critical(f"❌ LỖI NGHIÊM TRỌNG: {error_type}")
+                logger.critical(f"📝 {error_str[:300]}")
+                logger.critical("💡 Đây là lỗi không thể tự động fix. Vui lòng kiểm tra code/config.")
+                logger.critical("=" * 60)
+                # Vẫn thử lại sau một khoảng thời gian dài (có thể là lỗi tạm thời của server)
+                if consecutive_failures < max_consecutive_failures:
+                    logger.warning(f"⏳ Đợi 30 giây rồi thử lại...")
+                    time.sleep(30)
+                else:
+                    break
 
 
 if __name__ == '__main__':
