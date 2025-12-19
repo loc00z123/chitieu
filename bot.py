@@ -44,7 +44,8 @@ from services import (
     get_worksheet,
     google_search,
     generate_image,
-    generate_vietqr_url
+    generate_vietqr_url,
+    classify_intent_with_ai
 )
 
 # Load biến môi trường từ file .env
@@ -78,6 +79,10 @@ except ImportError:
 # ==================== CẤU HÌNH ====================
 TELEGRAM_TOKEN = os.getenv('BOT_TOKEN', '')
 CREDENTIALS_FILE = 'credentials.json'
+
+# Google Search API Configuration (để kiểm tra trong error handling)
+GOOGLE_SEARCH_API_KEY = os.getenv('GOOGLE_SEARCH_API_KEY', '')
+GOOGLE_CSE_ID = os.getenv('GOOGLE_CSE_ID', '')
 SHEET_NAME = 'QuanLyChiTieu'
 SHEET_ID = os.getenv('GOOGLE_SHEET_ID', '')
 
@@ -318,6 +323,15 @@ def auto_categorize(item_name: str) -> str:
     return "Khác"
 
 
+def has_amount(text: str) -> bool:
+    """
+    Kiểm tra xem text có chứa số tiền hay không
+    Trả về True nếu tìm thấy số tiền, False nếu không
+    """
+    amount, _ = parse_amount(text)
+    return amount > 0
+
+
 def parse_single_item(text: str) -> dict:
     """Parse một món đơn lẻ"""
     amount, amount_positions = parse_amount(text)
@@ -386,7 +400,9 @@ def parse_with_groq(input_data, context_data: str = "", input_type: str = 'text'
     else:
         # System Prompt cho Text - Cải thiện phân loại + Chat History + Backdated Entry + Google Search
         system_prompt = (
-            "Bạn là Trợ lý AI thông minh của Lộc.\n"
+            "Bạn là Trợ lý AI thông minh kiêm thư ký riêng của Lộc. "
+            "Bạn trả lời ngắn gọn, chuyên nghiệp nhưng thân thiện. "
+            "Luôn sẵn sàng giúp đỡ và hỗ trợ.\n"
             f"Thời gian hiện tại của hệ thống là: {current_time_str} (Ngày: {current_date_str}).\n"
             "Dữ liệu hệ thống và lịch sử trò chuyện sẽ được cung cấp trong user message.\n\n"
             "PHÂN LOẠI INPUT (QUAN TRỌNG):\n\n"
@@ -405,11 +421,12 @@ def parse_with_groq(input_data, context_data: str = "", input_type: str = 'text'
             "   - Đặc điểm: User muốn tạo mã QR để nhận tiền chuyển khoản, có số tiền và nội dung (tùy chọn).\n"
             "   - Output: {\"type\": \"qr_request\", \"amount\": số_tiền_int, \"content\": \"nội dung chuyển khoản\" hoặc \"\"}\n"
             "   - Lưu ý: Phải trích xuất số tiền từ text (xử lý 'k', 'tr', 'ng', 'nghìn', 'triệu'). Nếu không có nội dung, để content = \"\".\n\n"
-            "4. **TYPE: \"chat\"** (Khi User hỏi về dữ liệu hệ thống, tra cứu, hoặc tâm sự):\n"
-            "   - VD: \"hôm nay tiêu bao nhiêu?\", \"tài chính thế nào?\", \"còn bao nhiêu tiền?\", \"danh sách chi tiêu hôm nay\", \"chào em\", \"cảm ơn\".\n"
-            "   - Đặc điểm: Là câu HỎI về dữ liệu hệ thống, TRA CỨU, hoặc TÂM SỰ, KHÔNG phải nhập liệu mới.\n"
-            "   - Output: {\"type\": \"chat\", \"response\": \"Câu trả lời dựa trên Dữ liệu hệ thống...\"}\n"
-            "   - Lưu ý: Nếu user hỏi \"tiêu bao nhiêu\", hãy nhìn vào mục 'Hôm nay' hoặc 'Tháng này' trong dữ liệu hệ thống để trả lời chính xác con số.\n\n"
+            "4. **TYPE: \"chat\"** (Khi User hỏi về dữ liệu hệ thống, tra cứu, tâm sự, hoặc nói chuyện bình thường):\n"
+            "   - VD: \"hôm nay tiêu bao nhiêu?\", \"tài chính thế nào?\", \"còn bao nhiêu tiền?\", \"danh sách chi tiêu hôm nay\", \"chào em\", \"cảm ơn\", \"front end là gì\", \"hướng dẫn tôi học\".\n"
+            "   - Đặc điểm: Là câu HỎI về dữ liệu hệ thống, TRA CỨU, TÂM SỰ, hoặc câu hỏi thông thường KHÔNG có số tiền, KHÔNG phải nhập liệu mới.\n"
+            "   - Output: {\"type\": \"chat\", \"response\": \"Câu trả lời vui vẻ, ngắn gọn, dựa trên Dữ liệu hệ thống (nếu có)...\"}\n"
+            "   - Lưu ý: Nếu user hỏi \"tiêu bao nhiêu\", hãy nhìn vào mục 'Hôm nay' hoặc 'Tháng này' trong dữ liệu hệ thống để trả lời chính xác con số.\n"
+            "   - Nếu user hỏi câu hỏi thông thường (không liên quan tài chính), hãy trả lời vui vẻ, thân thiện. Nếu cần thông tin thực tế, hãy dùng type \"search\".\n\n"
             "XỬ LÝ NGÀY THÁNG (BACKDATED ENTRY - QUAN TRỌNG):\n"
             f"Thời gian hiện tại: {current_time_str} (Ngày: {current_date_str}).\n"
             "Nhiệm vụ: Trích xuất chi tiêu và NGÀY THÁNG từ input.\n\n"
@@ -758,20 +775,6 @@ def parse_multiple_items(text: str) -> list:
     logger.info("=" * 60)
     
     return results
-
-
-from keep_alive import keep_alive
-from services import (
-    init_google_sheets,
-    save_expenses_to_sheet,
-    calculate_weekly_spend,
-    get_financial_context,
-    get_expense_report,
-    get_worksheet,
-    google_search,
-    generate_image,
-    generate_vietqr_url
-)
 
 # ==================== KẾT NỐI GOOGLE SHEETS ====================
 # Sử dụng hàm từ services.py
@@ -2255,9 +2258,153 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Đã xảy ra lỗi khi xử lý ảnh.")
 
 
-# ==================== XỬ LÝ TEXT (TÁCH RA TỪ HANDLE_MESSAGE) ====================
+# ==================== HELPER FUNCTIONS FOR INTENT HANDLING ====================
+async def send_alarm_spam(context: ContextTypes.DEFAULT_TYPE):
+    """Hàm spam báo thức - Gửi tin nhắn lặp lại mỗi 10 giây"""
+    chat_id = context.job.chat_id
+    username = context.job.data.get('username', 'sếp')
+    
+    try:
+        spam_message = f"Dậy đi! Dậy đi! 📢 @{username}"
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=spam_message,
+            parse_mode=ParseMode.MARKDOWN
+        )
+        logger.info(f"📢 Đã gửi spam báo thức cho chat {chat_id}")
+    except Exception as e:
+        logger.error(f"❌ Lỗi khi gửi spam báo thức: {e}")
+
+
+async def trigger_alarm(context: ContextTypes.DEFAULT_TYPE):
+    """Hàm kích hoạt báo thức - Gửi tin nhắn đầu tiên và bắt đầu spam"""
+    chat_id = context.job.chat_id
+    username = context.job.data.get('username', 'sếp')
+    note = context.job.data.get('note', 'Dậy ngay sếp ơi')
+    
+    try:
+        # Gửi tin nhắn báo thức đầu tiên
+        alarm_message = f"🚨 **BÁO THỨC:** {note}! Dậy ngay sếp ơi @{username}"
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=alarm_message,
+            parse_mode=ParseMode.MARKDOWN
+        )
+        logger.info(f"🚨 Đã gửi báo thức cho chat {chat_id}")
+        
+        # Kích hoạt spam mode - Tạo job lặp lại mỗi 30 giây
+        job_queue = context.application.job_queue
+        if job_queue:
+            # Lưu job spam vào chat_data để quản lý
+            if 'alarm_spam_jobs' not in context.chat_data:
+                context.chat_data['alarm_spam_jobs'] = []
+            
+            spam_job = job_queue.run_repeating(
+                send_alarm_spam,
+                interval=10,  # 30 giây
+                first=0,  # Bắt đầu ngay
+                chat_id=chat_id,
+                data={'username': username}
+            )
+            
+            context.chat_data['alarm_spam_jobs'].append(spam_job)
+            logger.info(f"📢 Đã kích hoạt spam mode cho chat {chat_id}")
+            
+    except Exception as e:
+        logger.error(f"❌ Lỗi khi kích hoạt báo thức: {e}", exc_info=True)
+
+
+async def handle_alarm_intent(update: Update, context: ContextTypes.DEFAULT_TYPE, alarm_data: dict):
+    """Xử lý ALARM intent - Đặt báo thức với spam mode"""
+    user_id = str(update.effective_user.id)
+    time_str = alarm_data.get('time', '')
+    note = alarm_data.get('note', 'Dậy ngay sếp ơi')
+    username = update.effective_user.username or update.effective_user.first_name or 'sếp'
+    
+    if not time_str:
+        await update.message.reply_text(
+            "❌ Không thể xác định thời gian. Vui lòng nhập: `/remind HH:MM`",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+    
+    try:
+        # Parse thời gian (HH:MM)
+        time_parts = time_str.split(':')
+        if len(time_parts) != 2:
+            raise ValueError("Sai định dạng")
+        
+        hour = int(time_parts[0])
+        minute = int(time_parts[1])
+        
+        if hour < 0 or hour > 23 or minute < 0 or minute > 59:
+            raise ValueError("Giờ không hợp lệ")
+        
+        # Tính toán thời gian đến giờ hẹn
+        now = datetime.now()
+        alarm_time = dt_time(hour, minute)
+        alarm_datetime = datetime.combine(now.date(), alarm_time)
+        
+        # Nếu giờ hẹn đã qua hôm nay, đặt cho ngày mai
+        if alarm_datetime <= now:
+            alarm_datetime += timedelta(days=1)
+        
+        # Tính số giây đến giờ hẹn
+        seconds_until_alarm = (alarm_datetime - now).total_seconds()
+        
+        # Lưu reminder
+        user_reminders[user_id] = {
+            'hour': hour, 
+            'minute': minute, 
+            'note': note,
+            'chat_id': update.effective_chat.id
+        }
+        save_reminders()
+        
+        # Lên lịch job báo thức (chạy 1 lần)
+        job_queue = context.application.job_queue
+        if job_queue:
+            # Xóa job cũ nếu có
+            current_jobs = job_queue.get_jobs_by_name(f"alarm_{user_id}")
+            for job in current_jobs:
+                job.schedule_removal()
+            
+            # Tạo job mới - chạy 1 lần vào giờ hẹn
+            job_queue.run_once(
+                trigger_alarm,
+                when=seconds_until_alarm,
+                name=f"alarm_{user_id}",
+                chat_id=update.effective_chat.id,
+                data={'username': username, 'note': note}
+            )
+        
+        response = (
+            f"✅ **Đã đặt báo thức thành công!**\n\n"
+            f"🔔 Bot sẽ báo thức lúc **{hour:02d}:{minute:02d}**\n"
+            f"📝 Nội dung: {note}\n"
+            f"📢 **Spam mode:** Bot sẽ spam mỗi 30 giây cho đến khi bạn dừng\n\n"
+            f"💡 Gõ 'Dậy rồi' hoặc 'Thôi đừng spam nữa' để tắt báo thức"
+        )
+        await update.message.reply_text(response, parse_mode=ParseMode.MARKDOWN)
+        logger.info(f"✅ Đã đặt báo thức với spam mode: {hour:02d}:{minute:02d} (sau {seconds_until_alarm:.0f} giây)")
+        
+    except (ValueError, IndexError) as e:
+        logger.error(f"❌ Lỗi parse thời gian: {e}", exc_info=True)
+        await update.message.reply_text(
+            "❌ Không thể đặt báo thức. Vui lòng nhập: `/remind HH:MM`",
+            parse_mode=ParseMode.MARKDOWN
+        )
+    except Exception as e:
+        logger.error(f"❌ Lỗi khi đặt báo thức: {e}", exc_info=True)
+        await update.message.reply_text(
+            "❌ Đã xảy ra lỗi khi đặt báo thức. Vui lòng thử lại sau.",
+            parse_mode=ParseMode.MARKDOWN
+        )
+
+
+# ==================== XỬ LÝ TEXT (INTENT-BASED) ====================
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Xử lý tin nhắn text - Tách ra từ handle_message"""
+    """Xử lý tin nhắn text - Sử dụng Intent Classification"""
     global groq_disabled
     
     user_text = update.message.text
@@ -2271,6 +2418,370 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info("-" * 60)
     
     try:
+        # BƯỚC 1: Intent Classification với AI
+        chat_history = format_chat_history(user_id)
+        intent_result = None
+        
+        if groq_client and not groq_disabled:
+            try:
+                intent_result = classify_intent_with_ai(user_text, chat_history, groq_client)
+                logger.info(f"🧠 Intent được phân loại: {intent_result['intent']}")
+            except Exception as e:
+                logger.warning(f"⚠️ Intent Classification thất bại: {e}")
+                intent_result = None
+        
+        # Nếu không có intent, fallback về logic cũ
+        if not intent_result:
+            logger.info("🔄 Fallback về logic cũ (không có Intent Classification)")
+            await handle_text_fallback(update, context)
+            return
+        
+        intent = intent_result.get('intent', 'CHAT')
+        intent_data = intent_result.get('data', {})
+        
+        # BƯỚC 2: Định tuyến dựa trên Intent (match/case pattern)
+        try:
+            if intent == 'EXPENSE':
+                # Xử lý chi tiêu
+                await handle_expense_intent(update, context, intent_data)
+                
+            elif intent == 'ALARM':
+                # Xử lý đặt báo thức với spam mode
+                await handle_alarm_intent(update, context, intent_data)
+                
+            elif intent == 'STOP':
+                # Xử lý dừng báo thức spam
+                await handle_stop_intent(update, context)
+                
+            elif intent == 'QR' or intent == 'QR_CODE':
+                # Xử lý tạo QR code
+                await handle_qr_intent(update, context, intent_data)
+                
+            elif intent == 'STOP':
+                # Xử lý dừng báo thức spam
+                await handle_stop_intent(update, context)
+                
+            elif intent == 'SEARCH':
+                # Xử lý tìm kiếm Google
+                await handle_search_intent(update, context, intent_data)
+                
+            elif intent == 'CHAT':
+                # Xử lý chat thông thường
+                await handle_chat_intent(update, context, intent_data, user_text, user_id, chat_history)
+                
+            else:
+                # Fallback về chat
+                logger.warning(f"⚠️ Intent không xác định: {intent}, chuyển về CHAT")
+                await handle_chat_intent(update, context, intent_data, user_text, user_id, chat_history)
+                
+        except Exception as e:
+            logger.error(f"❌ Lỗi khi xử lý intent {intent}: {e}", exc_info=True)
+            # Fallback về chat với thông báo lỗi khéo léo
+            error_response = (
+                "Xin lỗi sếp, em gặp chút vấn đề kỹ thuật. "
+                "Vui lòng thử lại hoặc mô tả rõ hơn yêu cầu của sếp nhé! 😊"
+            )
+            await update.message.reply_text(error_response, parse_mode=ParseMode.MARKDOWN)
+            add_to_memory(user_id, 'user', user_text)
+            add_to_memory(user_id, 'bot', error_response)
+        
+        logger.info("=" * 60)
+        logger.info("✅ XỬ LÝ TIN NHẮN THÀNH CÔNG!")
+        logger.info("=" * 60)
+        
+    except Exception as e:
+        logger.error("=" * 60)
+        logger.error("❌ XỬ LÝ TIN NHẮN THẤT BẠI (Exception)")
+        logger.error(f"📝 Lỗi: {e}")
+        logger.error(f"💡 Chi tiết:", exc_info=True)
+        
+        # Fallback về logic cũ
+        await handle_text_fallback(update, context)
+
+
+# ==================== INTENT HANDLERS ====================
+async def handle_expense_intent(update: Update, context: ContextTypes.DEFAULT_TYPE, intent_data: dict):
+    """Xử lý EXPENSE intent"""
+    user_text = update.message.text
+    user_id = update.effective_user.id
+    
+    logger.info("💰 Xử lý EXPENSE intent...")
+    
+    # Lấy thông tin từ intent_data
+    amount = intent_data.get('amount', 0)
+    item = intent_data.get('item', '')
+    expense_date = intent_data.get('date')
+    
+    # Nếu không có đủ thông tin, fallback về logic cũ
+    if not amount or not item:
+        logger.warning("⚠️ Intent data không đủ, fallback về logic cũ")
+        await handle_text_fallback(update, context)
+        return
+    
+    # Tạo expense object
+    expense = {
+        'item': item,
+        'amount': amount,
+        'category': auto_categorize(item)
+    }
+    if expense_date:
+        expense['date'] = expense_date
+    
+    # Lưu vào Sheet
+    saved_expenses = save_expenses_to_sheet([expense])
+    
+    # Tính toán và trả lời
+    weekly_data = calculate_weekly_spend()
+    week_total = weekly_data['total']
+    remaining = weekly_data['remaining']
+    
+    response = f"✅ **Đã lưu:**\n"
+    response += f"• {expense['item']}: {expense['amount']:,}đ ({expense['category']})"
+    response += f"\n\n📊 **Tuần này:** {week_total:,}đ / {WEEKLY_LIMIT:,}đ"
+    
+    if remaining < 0:
+        over_budget = abs(remaining)
+        response += f"\n⚠️ **BÁO ĐỘNG:** Bạn đã tiêu lố {over_budget:,}đ!"
+    else:
+        response += f" (Còn dư: {remaining:,}đ)"
+    
+    await update.message.reply_text(response, parse_mode=ParseMode.MARKDOWN)
+    add_to_memory(user_id, 'user', user_text)
+    add_to_memory(user_id, 'bot', response)
+
+
+async def handle_stop_intent(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Xử lý STOP intent - Dừng báo thức spam"""
+    user_id = str(update.effective_user.id)
+    chat_id = update.effective_chat.id
+    username = update.effective_user.username or update.effective_user.first_name or 'sếp'
+    
+    try:
+        logger.info(f"🛑 Xử lý STOP intent cho user {user_id}")
+        
+        # Dừng các job spam trong chat_data
+        spam_jobs_stopped = 0
+        if 'alarm_spam_jobs' in context.chat_data:
+            spam_jobs = context.chat_data.get('alarm_spam_jobs', [])
+            for job in spam_jobs[:]:  # Copy list để tránh lỗi khi modify
+                try:
+                    job.schedule_removal()
+                    spam_jobs_stopped += 1
+                    logger.info(f"✅ Đã dừng spam job: {job.name}")
+                except Exception as e:
+                    logger.warning(f"⚠️ Không thể dừng job: {e}")
+            
+            # Xóa danh sách spam jobs
+            context.chat_data['alarm_spam_jobs'] = []
+        
+        # Dừng các job báo thức chính
+        job_queue = context.application.job_queue
+        if job_queue:
+            # Tìm và dừng job báo thức
+            alarm_jobs = job_queue.get_jobs_by_name(f"alarm_{user_id}")
+            for job in alarm_jobs:
+                try:
+                    job.schedule_removal()
+                    logger.info(f"✅ Đã dừng alarm job: {job.name}")
+                except Exception as e:
+                    logger.warning(f"⚠️ Không thể dừng alarm job: {e}")
+        
+        # Xóa reminder nếu có
+        if user_id in user_reminders:
+            del user_reminders[user_id]
+            save_reminders()
+        
+        response = "✅ Ok, đã tắt báo thức. Chúc sếp ngày mới năng lượng! ⚡"
+        await update.message.reply_text(response, parse_mode=ParseMode.MARKDOWN)
+        
+        add_to_memory(update.effective_user.id, 'user', update.message.text)
+        add_to_memory(update.effective_user.id, 'bot', response)
+        
+        logger.info(f"✅ Đã dừng {spam_jobs_stopped} spam job(s) cho user {user_id}")
+        
+    except Exception as e:
+        logger.error(f"❌ Lỗi khi dừng báo thức: {e}", exc_info=True)
+        await update.message.reply_text(
+            "❌ Đã xảy ra lỗi khi dừng báo thức. Vui lòng thử lại sau.",
+            parse_mode=ParseMode.MARKDOWN
+        )
+
+
+async def handle_qr_intent(update: Update, context: ContextTypes.DEFAULT_TYPE, intent_data: dict):
+    """Xử lý QR_CODE intent"""
+    user_id = update.effective_user.id
+    amount = intent_data.get('amount', 0)
+    content = intent_data.get('content', '')
+    
+    logger.info(f"💳 Xử lý QR_CODE intent: {amount:,}đ - '{content}'")
+    
+    if not amount or amount <= 0:
+        await update.message.reply_text(
+            "❌ Không thể xác định số tiền. Vui lòng nhập: `/pay [số tiền] [nội dung]`",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+    
+    # Tạo QR code
+    qr_url = generate_vietqr_url(amount, content)
+    
+    if not qr_url:
+        await update.message.reply_text("❌ Không thể tạo mã QR. Vui lòng thử lại sau.")
+        return
+    
+    # Tải và gửi ảnh QR
+    try:
+        import requests
+        import io
+        img_response = requests.get(qr_url, timeout=10)
+        if img_response.status_code == 200:
+            image_buffer = io.BytesIO(img_response.content)
+            image_buffer.seek(0)
+            
+            caption = (
+                f"💳 **Quét mã này bank cho sếp Lộc nha!**\n"
+                f"💰 **Số tiền:** {amount:,}đ\n"
+                f"🏦 **VPBank - 0375646013**\n"
+                f"👤 **LE PHUOC LOC**"
+            )
+            if content:
+                caption += f"\n📝 **Nội dung:** {content}"
+            
+            await update.message.reply_photo(
+                photo=image_buffer,
+                caption=caption,
+                parse_mode=ParseMode.MARKDOWN
+            )
+            
+            add_to_memory(user_id, 'user', update.message.text)
+            add_to_memory(user_id, 'bot', f"Đã tạo mã QR {amount:,}đ")
+        else:
+            await update.message.reply_text(f"❌ Không thể tải ảnh QR (HTTP {img_response.status_code})")
+    except Exception as e:
+        logger.error(f"❌ Lỗi tải ảnh QR: {e}", exc_info=True)
+        await update.message.reply_text("❌ Không thể tải ảnh QR. Vui lòng thử lại sau.")
+
+
+async def handle_search_intent(update: Update, context: ContextTypes.DEFAULT_TYPE, intent_data: dict):
+    """Xử lý SEARCH intent"""
+    user_text = update.message.text
+    user_id = update.effective_user.id
+    query = intent_data.get('query', user_text)
+    
+    logger.info(f"🔍 Xử lý SEARCH intent: '{query}'")
+    
+    if not query:
+        await update.message.reply_text("❌ Không thể xác định từ khóa tìm kiếm.")
+        return
+    
+    # Gọi Google Search
+    try:
+        search_results = google_search(query, num_results=5)
+        
+        if not search_results or "⚠️" in search_results:
+            await update.message.reply_text(
+                f"❌ {search_results if search_results else 'Không thể tìm kiếm. Vui lòng thử lại sau.'}"
+            )
+            return
+        
+        # Gửi kết quả lên Groq để tổng hợp
+        if groq_client and not groq_disabled:
+            try:
+                synthesis_prompt = (
+                    f"Đây là kết quả tìm kiếm từ Google cho câu hỏi: '{user_text}'\n\n"
+                    f"KẾT QUẢ TÌM KIẾM:\n{search_results}\n\n"
+                    f"Hãy trả lời câu hỏi ban đầu của user dựa trên thông tin tìm kiếm này. "
+                    f"Trả lời ngắn gọn, chuyên nghiệp nhưng thân thiện (kiểu thư ký riêng). "
+                    f"Trả về JSON: {{\"type\": \"chat\", \"response\": \"Câu trả lời...\"}}"
+                )
+                
+                final_result = parse_with_groq(synthesis_prompt, "", input_type='text', chat_history="")
+                
+                if final_result.get('type') == 'chat':
+                    bot_response = final_result.get('response', search_results)
+                    await update.message.reply_text(bot_response, parse_mode=ParseMode.MARKDOWN)
+                    add_to_memory(user_id, 'user', user_text)
+                    add_to_memory(user_id, 'bot', bot_response)
+                    return
+            except Exception as e:
+                logger.warning(f"⚠️ Groq synthesis thất bại: {e}")
+        
+        # Fallback: Gửi kết quả trực tiếp
+        await update.message.reply_text(
+            f"🔍 **Kết quả tìm kiếm:**\n\n{search_results}",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        add_to_memory(user_id, 'user', user_text)
+        add_to_memory(user_id, 'bot', search_results)
+        
+    except Exception as e:
+        logger.error(f"❌ Lỗi Google Search: {e}", exc_info=True)
+        await update.message.reply_text(
+            "⚠️ Không thể tìm kiếm lúc này. Vui lòng thử lại sau.",
+            parse_mode=ParseMode.MARKDOWN
+        )
+
+
+async def handle_chat_intent(update: Update, context: ContextTypes.DEFAULT_TYPE, intent_data: dict, 
+                            user_text: str, user_id: int, chat_history: str):
+    """Xử lý CHAT intent"""
+    logger.info("💬 Xử lý CHAT intent...")
+    
+    # Lấy financial context
+    context_data = get_financial_context()
+    
+    # Gọi AI để trả lời
+    if groq_client and not groq_disabled:
+        try:
+            # Cập nhật system prompt để bot trả lời ngắn gọn, chuyên nghiệp nhưng thân thiện
+            reply_instruction = intent_data.get('reply_instruction', '')
+            
+            groq_result = parse_with_groq(
+                user_text, 
+                context_data, 
+                input_type='text', 
+                chat_history=chat_history
+            )
+            
+            if groq_result and groq_result.get('type') == 'chat':
+                bot_response = groq_result.get('response', 'Xin lỗi, em không hiểu câu hỏi này.')
+                await update.message.reply_text(bot_response, parse_mode=ParseMode.MARKDOWN)
+                add_to_memory(user_id, 'user', user_text)
+                add_to_memory(user_id, 'bot', bot_response)
+                return
+        except Exception as e:
+            logger.warning(f"⚠️ Groq chat thất bại: {e}")
+    
+    # Fallback: Trả lời thân thiện
+    friendly_response = (
+        "👋 Xin chào! Em là bot quản lý chi tiêu của sếp Lộc.\n\n"
+        "💡 **Em có thể giúp:**\n"
+        "• Ghi chép chi tiêu (VD: `phở 50k`, `cơm 35k`)\n"
+        "• Xem báo cáo tài chính (`/report`)\n"
+        "• Tạo mã QR chuyển khoản (`/pay 50k nội dung`)\n"
+        "• Trả lời câu hỏi về tài chính\n\n"
+        "💬 **Hoặc gõ `/help` để xem hướng dẫn đầy đủ**"
+    )
+    await update.message.reply_text(friendly_response, parse_mode=ParseMode.MARKDOWN)
+    add_to_memory(user_id, 'user', user_text)
+    add_to_memory(user_id, 'bot', friendly_response)
+
+
+# ==================== FALLBACK HANDLER (LOGIC CŨ) ====================
+async def handle_text_fallback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Fallback về logic cũ nếu Intent Classification thất bại"""
+    global groq_disabled
+    
+    user_text = update.message.text
+    user_id = update.effective_user.id
+    
+    logger.info("🔄 Sử dụng Fallback Handler (Logic cũ)...")
+    
+    try:
+        # BƯỚC 1: Kiểm tra xem tin nhắn có chứa số tiền hay không
+        contains_amount = has_amount(user_text)
+        logger.info(f"🔍 Kiểm tra số tiền: {'CÓ' if contains_amount else 'KHÔNG'}")
+        
         # Lấy financial context
         context_data = get_financial_context()
         
@@ -2431,10 +2942,21 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         
                 except Exception as e:
                     logger.error(f"❌ Lỗi Google Search: {e}", exc_info=True)
-                    await update.message.reply_text(
-                        "⚠️ Không thể tìm kiếm lúc này.\n"
-                        "💡 Vui lòng thử lại sau hoặc kiểm tra cấu hình Google Search API."
-                    )
+                    # Kiểm tra xem có phải do thiếu API keys không
+                    if not GOOGLE_SEARCH_API_KEY or not GOOGLE_CSE_ID:
+                        error_msg = (
+                            "⚠️ **Tính năng tìm kiếm Google chưa được cấu hình.**\n\n"
+                            "💡 Để sử dụng tính năng này, vui lòng:\n"
+                            "1. Tạo Google Custom Search Engine\n"
+                            "2. Lấy API Key từ Google Cloud Console\n"
+                            "3. Thêm vào biến môi trường"
+                        )
+                    else:
+                        error_msg = (
+                            "⚠️ Không thể tìm kiếm lúc này.\n"
+                            "💡 Vui lòng thử lại sau hoặc kiểm tra cấu hình Google Search API."
+                        )
+                    await update.message.reply_text(error_msg, parse_mode=ParseMode.MARKDOWN)
                     return
                     
             elif groq_result['type'] == 'chat':
@@ -2583,7 +3105,59 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     except Exception as e:
                         logger.error(f"❌ Lỗi tải ảnh QR: {e}", exc_info=True)
         
-        # Fallback về Regex cho chi tiêu
+        # Fallback: Xử lý dựa trên việc có số tiền hay không
+        if not contains_amount:
+            # KHÔNG có số tiền → Coi là câu hỏi thông thường, gọi AI chat
+            logger.info("💬 Tin nhắn không có số tiền → Xử lý như chat thông thường")
+            
+            # Thử gọi Groq để chat (nếu chưa gọi hoặc lỗi)
+            if groq_client and not groq_disabled:
+                try:
+                    logger.info("🤖 Đang gọi Groq AI để trả lời câu hỏi...")
+                    groq_result = parse_with_groq(user_text, context_data, input_type='text', chat_history=chat_history)
+                    
+                    if groq_result and groq_result.get('type') == 'chat':
+                        bot_response = groq_result.get('response', 'Xin lỗi, em không hiểu câu hỏi này.')
+                        await update.message.reply_text(bot_response, parse_mode=ParseMode.MARKDOWN)
+                        
+                        # Lưu vào memory
+                        add_to_memory(user_id, 'user', user_text)
+                        add_to_memory(user_id, 'bot', bot_response)
+                        
+                        logger.info("✅ Đã gửi phản hồi chat cho user")
+                        logger.info("=" * 60)
+                        logger.info("✅ XỬ LÝ TIN NHẮN THÀNH CÔNG!")
+                        logger.info("=" * 60)
+                        return
+                except Exception as e:
+                    logger.warning(f"⚠️ Groq AI chat thất bại: {e}")
+            
+            # Nếu Groq không khả dụng, trả lời thân thiện
+            friendly_response = (
+                "👋 Xin chào! Em là bot quản lý chi tiêu của sếp Lộc.\n\n"
+                "💡 **Em có thể giúp:**\n"
+                "• Ghi chép chi tiêu (VD: `phở 50k`, `cơm 35k`)\n"
+                "• Xem báo cáo tài chính (`/report`)\n"
+                "• Tạo mã QR chuyển khoản (`/pay 50k nội dung`)\n"
+                "• Trả lời câu hỏi về tài chính\n\n"
+                "📝 **Để thêm chi tiêu, hãy nhập:**\n"
+                "• `phở 50k`\n"
+                "• `cơm 35k, trà đá 5k`\n\n"
+                "💬 **Hoặc gõ `/help` để xem hướng dẫn đầy đủ**"
+            )
+            await update.message.reply_text(friendly_response, parse_mode=ParseMode.MARKDOWN)
+            
+            # Lưu vào memory
+            add_to_memory(user_id, 'user', user_text)
+            add_to_memory(user_id, 'bot', friendly_response)
+            
+            logger.info("✅ Đã gửi phản hồi thân thiện cho user")
+            logger.info("=" * 60)
+            logger.info("✅ XỬ LÝ TIN NHẮN THÀNH CÔNG!")
+            logger.info("=" * 60)
+            return
+        
+        # CÓ số tiền → Xử lý như expense (Regex Fallback)
         logger.info("🔄 Sử dụng Regex Fallback cho chi tiêu...")
         expenses = parse_multiple_items(user_text)
         logger.info("✅ Đã sử dụng Regex Parsing (Fallback)")

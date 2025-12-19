@@ -8,6 +8,7 @@ All rights reserved.
 """
 
 import os
+import json
 import logging
 from datetime import datetime, timedelta
 from collections import defaultdict
@@ -15,6 +16,14 @@ import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 
 logger = logging.getLogger(__name__)
+
+# Import Groq AI cho Intent Classification
+try:
+    from groq import Groq
+    GROQ_AVAILABLE = True
+except ImportError:
+    GROQ_AVAILABLE = False
+    logger.warning("⚠️ Groq library not installed. Intent Classification will be disabled.")
 
 # Import Google Search API
 try:
@@ -33,6 +42,20 @@ WEEKLY_LIMIT = 700000  # 700 nghìn đồng/tuần
 # Google Search API Configuration
 GOOGLE_SEARCH_API_KEY = os.getenv('GOOGLE_SEARCH_API_KEY', '')
 GOOGLE_CSE_ID = os.getenv('GOOGLE_CSE_ID', '')
+
+# Kiểm tra và log cảnh báo nếu thiếu Google Search API keys
+if not GOOGLE_SEARCH_API_KEY or not GOOGLE_CSE_ID:
+    logger.warning("=" * 60)
+    logger.warning("⚠️ GOOGLE SEARCH API CHƯA ĐƯỢC CẤU HÌNH")
+    logger.warning("=" * 60)
+    logger.warning("💡 Tính năng tìm kiếm Google sẽ bị tắt.")
+    logger.warning("💡 Để bật tính năng này:")
+    logger.warning("   1. Tạo Google Custom Search Engine: https://programmablesearchengine.google.com/")
+    logger.warning("   2. Lấy API Key: https://console.cloud.google.com/apis/credentials")
+    logger.warning("   3. Thêm vào .env: GOOGLE_SEARCH_API_KEY=... và GOOGLE_CSE_ID=...")
+    logger.warning("=" * 60)
+else:
+    logger.info("✅ Google Search API đã được cấu hình")
 
 # VietQR Configuration
 MY_BANK_ID = "VPB"
@@ -698,6 +721,127 @@ def generate_image(prompt: str) -> bytes:
         logger.error(f"❌ Lỗi tạo ảnh: {e}", exc_info=True)
         return None
 
+
+# ==================== INTENT CLASSIFICATION ====================
+def classify_intent_with_ai(user_message: str, chat_history: str = "", groq_client=None) -> dict:
+    """
+    Phân loại ý định (Intent Classification) của user bằng AI
+    - user_message: Tin nhắn của user
+    - chat_history: Lịch sử chat (10 câu gần nhất)
+    - groq_client: Groq client instance (từ bot.py)
+    Trả về: dict với 'intent' và 'data'
+    """
+    if not groq_client or not GROQ_AVAILABLE:
+        logger.warning("⚠️ Groq client không khả dụng, không thể phân loại intent")
+        return {'intent': 'CHAT', 'data': {}}
+    
+    try:
+        logger.info("=" * 60)
+        logger.info("🧠 ĐANG PHÂN LOẠI Ý ĐỊNH (INTENT CLASSIFICATION)")
+        logger.info("=" * 60)
+        logger.info(f"💬 Tin nhắn: '{user_message[:100]}...'")
+        
+        # System Prompt cho Intent Classification
+        system_prompt = (
+            "Bạn là bộ não điều khiển Bot quản lý chi tiêu. "
+            "Nhiệm vụ: Phân tích câu nói của user và trả về JSON (CHỈ JSON, không giải thích) với cấu trúc:\n\n"
+            "{\n"
+            "  'intent': 'EXPENSE' | 'ALARM' | 'QR_CODE' | 'SEARCH' | 'CHAT',\n"
+            "  'data': { ...thông tin trích xuất được... }\n"
+            "}\n\n"
+            "CÁC LOẠI INTENT:\n\n"
+            "1. **EXPENSE**: User muốn ghi chép chi tiêu\n"
+            "   - Ví dụ: 'Mua cơm 30k', 'Ăn phở 50k', 'Đổ xăng 200k', 'Hôm qua mua áo 100k'\n"
+            "   - Output: {'intent': 'EXPENSE', 'data': {'amount': 30000, 'item': 'Mua cơm', 'date': null hoặc 'DD/MM/YYYY'}}\n\n"
+            "2. **ALARM**: User muốn đặt báo thức/nhắc nhở\n"
+            "   - Ví dụ: 'Gọi tao dậy lúc 6h sáng', 'Nhắc tôi lúc 21:30', 'Đặt báo thức 7h sáng mai', 'Dậy lúc 6:00'\n"
+            "   - Output: {'intent': 'ALARM', 'data': {'time': '06:00', 'note': 'Dậy'}}\n\n"
+            "3. **STOP**: User muốn dừng báo thức spam\n"
+            "   - Ví dụ: 'Thôi đừng spam nữa', 'Dậy rồi', 'Tắt báo thức', 'Dừng lại', 'Stop'\n"
+            "   - Output: {'intent': 'STOP', 'data': {}}\n\n"
+            "4. **QR**: User muốn tạo mã QR chuyển khoản\n"
+            "   - Ví dụ: 'Tạo qr đòi nợ 50k', 'Mã QR 100k tiền cafe', 'Tạo mã chuyển khoản 200k'\n"
+            "   - Output: {'intent': 'QR', 'data': {'amount': 50000, 'content': 'đòi nợ'}}\n\n"
+            "5. **SEARCH**: User muốn tìm kiếm thông tin thực tế\n"
+            "   - Ví dụ: 'Giá vàng hôm nay', 'Thời tiết Hà Nội', 'Tin tức mới nhất'\n"
+            "   - Output: {'intent': 'SEARCH', 'data': {'query': 'Giá vàng hôm nay'}}\n\n"
+            "6. **CHAT**: Câu hỏi thông thường, tâm sự, hoặc không thuộc các loại trên\n"
+            "   - Ví dụ: 'Buồn quá em ơi', 'Hôm nay tiêu bao nhiêu?', 'Cảm ơn em'\n"
+            "   - Output: {'intent': 'CHAT', 'data': {'reply_instruction': 'An ủi sếp' hoặc 'Trả lời câu hỏi về tài chính'}}\n\n"
+            "QUY TẮC:\n"
+            "- LUÔN trả về JSON hợp lệ, không markdown, không giải thích thêm.\n"
+            "- Nếu không chắc chắn, chọn 'CHAT'.\n"
+            "- Ưu tiên EXPENSE nếu có số tiền rõ ràng.\n"
+            "- Ưu tiên ALARM nếu có từ khóa thời gian + hành động nhắc nhở.\n"
+        )
+        
+        # Tạo user prompt với chat history
+        user_prompt_parts = []
+        if chat_history:
+            user_prompt_parts.append(f"Lịch sử trò chuyện:\n{chat_history}\n")
+        user_prompt_parts.append(f"Câu nói hiện tại của user: {user_message}")
+        user_prompt = "\n".join(user_prompt_parts)
+        
+        # Gọi Groq API
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
+        ]
+        
+        response = groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=messages,
+            temperature=0.3,
+            max_tokens=300,
+            response_format={"type": "json_object"}
+        )
+        
+        # Parse JSON response
+        raw_content = response.choices[0].message.content.strip()
+        logger.info(f"📥 Raw response từ AI: {raw_content}")
+        
+        # Loại bỏ markdown code blocks nếu có
+        if raw_content.startswith("```json"):
+            raw_content = raw_content[7:]
+        if raw_content.startswith("```"):
+            raw_content = raw_content[3:]
+        if raw_content.endswith("```"):
+            raw_content = raw_content[:-3]
+        raw_content = raw_content.strip()
+        
+        # Parse JSON
+        try:
+            result = json.loads(raw_content)
+            
+            # Validate intent
+            valid_intents = ['EXPENSE', 'ALARM', 'STOP', 'QR', 'SEARCH', 'CHAT']
+            intent = result.get('intent', 'CHAT')
+            if intent not in valid_intents:
+                logger.warning(f"⚠️ Intent không hợp lệ: {intent}, chuyển về CHAT")
+                intent = 'CHAT'
+            
+            data = result.get('data', {})
+            
+            logger.info(f"✅ Intent được phân loại: {intent}")
+            logger.info(f"📊 Data: {data}")
+            logger.info("=" * 60)
+            
+            return {
+                'intent': intent,
+                'data': data
+            }
+            
+        except json.JSONDecodeError as e:
+            logger.error(f"❌ Lỗi parse JSON từ Intent Classification: {e}")
+            logger.error(f"📝 Raw response: {raw_content}")
+            # Fallback về CHAT
+            return {'intent': 'CHAT', 'data': {}}
+            
+    except Exception as e:
+        logger.error(f"❌ Lỗi Intent Classification: {e}", exc_info=True)
+        # Fallback về CHAT
+        return {'intent': 'CHAT', 'data': {}}
+        
 
 # ==================== VIETQR GENERATION ====================
 def generate_vietqr_url(amount: int, content: str = "") -> str:

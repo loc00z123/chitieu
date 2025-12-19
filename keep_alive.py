@@ -50,8 +50,8 @@ def check_api_key():
 
 @app.route('/')
 def home():
-    """Route chính - Render sẽ ping vào đây"""
-    return "I am alive - ExpenseBot API Server"
+    """Route chính - Render sẽ ping vào đây để keep-alive"""
+    return "Bot is alive!"
 
 
 @app.route('/api/expenses', methods=['GET'])
@@ -145,12 +145,17 @@ def health():
 
 
 def run():
-    """Chạy Flask server trên port 8080"""
+    """Chạy Flask server trên port từ biến môi trường PORT (mặc định 8080)"""
+    # Lấy port từ biến môi trường (Render sẽ cung cấp)
+    port = int(os.getenv('PORT', 8080))
+    
     # Tắt cảnh báo development server
     log = logging.getLogger('werkzeug')
     log.setLevel(logging.ERROR)
+    
+    logger.info(f"🌐 Flask server đang chạy trên port {port}")
     # Chạy server với debug=False để tắt cảnh báo
-    app.run(host='0.0.0.0', port=8080, debug=False)
+    app.run(host='0.0.0.0', port=port, debug=False)
 
 
 def keep_alive():
@@ -166,4 +171,8 @@ def keep_alive():
     t = Thread(target=run)
     t.daemon = True
     t.start()
-    logger.info("✅ Flask API Server đã khởi động trên port 8080")
+    
+    # Lấy port để log
+    port = int(os.getenv('PORT', 8080))
+    logger.info(f"✅ Flask Keep-Alive Server đã khởi động trên port {port}")
+    logger.info("💡 Render sẽ tự động ping route '/' để giữ bot không bị sleep")
