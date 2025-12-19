@@ -58,11 +58,11 @@ if not GOOGLE_SEARCH_API_KEY or not GOOGLE_CSE_ID:
 else:
     logger.info("✅ Google Search API đã được cấu hình")
 
-# VietQR Configuration
-MY_BANK_ID = "VPB"
-MY_ACCOUNT_NO = "0375646013"
-MY_ACCOUNT_NAME = "LE PHUOC LOC"
-MY_TEMPLATE = "compact"
+# VietQR Configuration (từ biến môi trường)
+MY_BANK_ID = os.getenv('MY_BANK_ID', 'VPB')
+MY_ACCOUNT_NO = os.getenv('MY_ACCOUNT_NO', '0375646013')
+MY_ACCOUNT_NAME = os.getenv('MY_ACCOUNT_NAME', 'LE PHUOC LOC')
+MY_TEMPLATE = os.getenv('MY_TEMPLATE', 'compact')
 
 # Global worksheet instance
 worksheet = None
@@ -648,16 +648,32 @@ def google_search(query: str, num_results: int = 5) -> str:
             logger.warning("⚠️ Không tìm thấy kết quả nào")
             return "Không tìm thấy kết quả nào cho từ khóa này."
         
-        # Tạo chuỗi kết quả
+        # Tạo chuỗi kết quả (escape markdown để tránh lỗi parse entities)
         search_results = []
         for i, item in enumerate(items[:num_results], 1):
             title = item.get('title', 'Không có tiêu đề')
             snippet = item.get('snippet', 'Không có mô tả')
             link = item.get('link', '')
             
+            # Escape markdown trong title và snippet để tránh lỗi parse entities
+            # Thay thế các ký tự markdown đặc biệt
+            def escape_markdown_simple(text: str) -> str:
+                """Escape markdown đơn giản - thay thế ký tự đặc biệt"""
+                if not text:
+                    return text
+                # Escape các ký tự markdown: * _ [ ] ( ) ` ~
+                text = text.replace('*', '\\*').replace('_', '\\_')
+                text = text.replace('[', '\\[').replace(']', '\\]')
+                text = text.replace('(', '\\(').replace(')', '\\)')
+                text = text.replace('`', '\\`').replace('~', '\\~')
+                return text
+            
+            title_escaped = escape_markdown_simple(title)
+            snippet_escaped = escape_markdown_simple(snippet)
+            
             search_results.append(
-                f"{i}. **{title}**\n"
-                f"   {snippet}\n"
+                f"{i}. *{title_escaped}*\n"
+                f"   {snippet_escaped}\n"
                 f"   🔗 {link}"
             )
         

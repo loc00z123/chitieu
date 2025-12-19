@@ -37,3 +37,8 @@ else:
         print("1. Tim process: ps aux | grep bot.py")
         print("2. Dung process: kill <PID>")
 
+
+
+
+
+

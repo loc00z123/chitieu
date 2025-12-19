@@ -83,3 +83,8 @@ Bot sẽ tự động tìm kiếm và trả lời dựa trên kết quả Google
 - Bạn đã dùng hết 100 requests miễn phí trong ngày
 - Đợi đến ngày hôm sau hoặc nâng cấp gói
 
+
+
+
+
+
