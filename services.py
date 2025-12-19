@@ -10,6 +10,7 @@ All rights reserved.
 import os
 import json
 import logging
+import difflib
 from datetime import datetime, timedelta
 from collections import defaultdict
 import gspread
@@ -878,4 +879,159 @@ def generate_vietqr_url(amount: int, content: str = "") -> str:
     except Exception as e:
         logger.error(f"❌ Lỗi tạo VietQR URL: {e}", exc_info=True)
         return ""
+
+
+# ==================== DELETE EXPENSE BY NAME ====================
+def find_expense_by_name(user_input: str, search_in_month: bool = False) -> dict:
+    """
+    Tìm kiếm giao dịch theo tên món sử dụng difflib để tìm tương đồng
+    - user_input: Từ khóa user nhập (ví dụ: "com ga", "bun bo")
+    - search_in_month: True = tìm trong tháng này, False = tìm trong hôm nay
+    Trả về: dict với 'found': True/False, 'match': thông tin món tìm thấy, 'row_index': số dòng
+    """
+    logger.info("=" * 60)
+    logger.info(f"🔍 ĐANG TÌM KIẾM GIAO DỊCH: '{user_input}'")
+    logger.info(f"📅 Phạm vi: {'Tháng này' if search_in_month else 'Hôm nay'}")
+    logger.info("=" * 60)
+    
+    ws = get_worksheet()
+    if ws is None:
+        raise ValueError("Google Sheets chưa được khởi tạo")
+    
+    try:
+        all_data = ws.get_all_values()
+        
+        # Kiểm tra nếu Sheet trống hoặc chỉ có header
+        if len(all_data) <= 1:
+            logger.warning("⚠️ Sheet trống, không có gì để tìm")
+            return {'found': False, 'match': None, 'row_index': None}
+        
+        # Lấy thời gian hiện tại
+        now = datetime.now()
+        today = now.day
+        current_month = now.month
+        current_year = now.year
+        
+        # Lọc dữ liệu theo phạm vi tìm kiếm
+        valid_expenses = []
+        for idx, row in enumerate(all_data[1:], start=2):  # Bắt đầu từ dòng 2 (bỏ header)
+            if len(row) < 7:
+                continue
+            
+            try:
+                row_day = int(row[1]) if row[1] else 0
+                row_month = int(row[2]) if row[2] else 0
+                row_year = int(row[3]) if row[3] else 0
+                item_name = row[4] if len(row) > 4 else ''
+                amount = int(row[6]) if len(row) > 6 and row[6] else 0
+                category = row[5] if len(row) > 5 else 'Khác'
+                
+                # Kiểm tra phạm vi
+                if search_in_month:
+                    # Tìm trong tháng này
+                    if row_month == current_month and row_year == current_year:
+                        valid_expenses.append({
+                            'row_index': idx,
+                            'item': item_name,
+                            'amount': amount,
+                            'category': category,
+                            'date': f"{row_day}/{row_month}/{row_year}"
+                        })
+                else:
+                    # Tìm trong hôm nay
+                    if row_day == today and row_month == current_month and row_year == current_year:
+                        valid_expenses.append({
+                            'row_index': idx,
+                            'item': item_name,
+                            'amount': amount,
+                            'category': category,
+                            'date': f"{row_day}/{row_month}/{row_year}"
+                        })
+            except (ValueError, IndexError):
+                continue
+        
+        if not valid_expenses:
+            logger.warning(f"⚠️ Không tìm thấy giao dịch nào trong phạm vi tìm kiếm")
+            return {'found': False, 'match': None, 'row_index': None}
+        
+        # Lấy danh sách tên món
+        item_names = [exp['item'] for exp in valid_expenses]
+        
+        # Sử dụng difflib để tìm món tương đồng
+        matches = difflib.get_close_matches(
+            user_input.lower(),
+            [name.lower() for name in item_names],
+            n=1,
+            cutoff=0.6
+        )
+        
+        if not matches:
+            logger.warning(f"⚠️ Không tìm thấy món nào tương đồng với '{user_input}'")
+            return {'found': False, 'match': None, 'row_index': None}
+        
+        # Tìm expense tương ứng với match
+        matched_name_lower = matches[0]
+        for exp in valid_expenses:
+            if exp['item'].lower() == matched_name_lower:
+                logger.info(f"✅ Tìm thấy món tương đồng: '{exp['item']}' (độ tương đồng với '{user_input}')")
+                return {
+                    'found': True,
+                    'match': exp,
+                    'row_index': exp['row_index']
+                }
+        
+        return {'found': False, 'match': None, 'row_index': None}
+        
+    except Exception as e:
+        logger.error(f"❌ Lỗi khi tìm kiếm giao dịch: {e}", exc_info=True)
+        raise
+
+
+def delete_expense_by_row_index(row_index: int) -> dict:
+    """
+    Xóa giao dịch theo số dòng trong Google Sheets
+    - row_index: Số dòng cần xóa (1-based, bao gồm header)
+    Trả về: dict với thông tin giao dịch đã xóa
+    """
+    logger.info("=" * 60)
+    logger.info(f"🗑️ ĐANG XÓA GIAO DỊCH Ở DÒNG {row_index}")
+    logger.info("=" * 60)
+    
+    ws = get_worksheet()
+    if ws is None:
+        raise ValueError("Google Sheets chưa được khởi tạo")
+    
+    try:
+        all_data = ws.get_all_values()
+        
+        # Kiểm tra row_index hợp lệ
+        if row_index < 2 or row_index > len(all_data):
+            raise ValueError(f"Row index {row_index} không hợp lệ")
+        
+        # Lấy thông tin dòng sẽ xóa
+        row_to_delete = all_data[row_index - 1]  # Convert 1-based to 0-based
+        
+        if len(row_to_delete) < 7:
+            raise ValueError("Dòng không có đủ dữ liệu")
+        
+        deleted_info = {
+            'item': row_to_delete[4] if len(row_to_delete) > 4 else 'Không xác định',
+            'amount': int(row_to_delete[6]) if len(row_to_delete) > 6 and row_to_delete[6] else 0,
+            'category': row_to_delete[5] if len(row_to_delete) > 5 else 'Khác',
+            'date': f"{row_to_delete[1]}/{row_to_delete[2]}/{row_to_delete[3]}" if len(row_to_delete) > 3 else 'N/A'
+        }
+        
+        # Xóa dòng
+        logger.info(f"🗑️ Đang xóa dòng {row_index}: {deleted_info['item']} - {deleted_info['amount']:,}đ")
+        ws.delete_rows(row_index)
+        
+        logger.info("=" * 60)
+        logger.info("✅ Đã xóa giao dịch thành công!")
+        logger.info("=" * 60)
+        
+        return deleted_info
+        
+    except Exception as e:
+        logger.error(f"❌ Lỗi khi xóa giao dịch: {e}", exc_info=True)
+        raise
 

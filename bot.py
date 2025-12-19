@@ -21,8 +21,8 @@ import requests
 from datetime import datetime, timedelta, time as dt_time
 from collections import defaultdict
 from dotenv import load_dotenv
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, JobQueue
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes, JobQueue
 from telegram.constants import ParseMode
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
@@ -45,7 +45,9 @@ from services import (
     google_search,
     generate_image,
     generate_vietqr_url,
-    classify_intent_with_ai
+    classify_intent_with_ai,
+    find_expense_by_name,
+    delete_expense_by_row_index
 )
 
 # Load biến môi trường từ file .env
@@ -1034,6 +1036,121 @@ async def undo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"❌ Lỗi khi xóa giao dịch: {e}")
         error_msg = "❌ Đã xảy ra lỗi khi xóa giao dịch. Vui lòng thử lại sau."
         await update.message.reply_text(error_msg)
+
+
+async def delete_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Xử lý lệnh /delete hoặc /xoa - Xóa giao dịch theo tên món (tìm kiếm thông minh)"""
+    logger.info(f"📨 Nhận lệnh /delete từ user: {update.effective_user.id}")
+    
+    try:
+        # Kiểm tra xem user có nhập tên món không
+        if not context.args or len(context.args) == 0:
+            response = (
+                "❌ **Sai cú pháp!**\n\n"
+                "💡 Cách sử dụng:\n"
+                "• `/delete com ga` - Xóa món 'Cơm gà' (tìm trong hôm nay)\n"
+                "• `/delete bun bo` - Xóa món 'Bún bò' (tìm trong hôm nay)\n"
+                "• `/xoa pho` - Xóa món 'Phở' (tìm trong hôm nay)\n\n"
+                "🤖 Bot sẽ tự động tìm món tương đồng nếu bạn gõ không chính xác 100%.\n"
+                "Ví dụ: Gõ 'com ga' sẽ tìm thấy 'Cơm gà xối mỡ'."
+            )
+            await update.message.reply_text(response, parse_mode=ParseMode.MARKDOWN)
+            return
+        
+        # Lấy từ khóa tìm kiếm từ user
+        user_input = ' '.join(context.args)
+        logger.info(f"🔍 User muốn xóa món: '{user_input}'")
+        
+        # Tìm kiếm trong hôm nay (có thể mở rộng để tìm trong tháng)
+        search_result = find_expense_by_name(user_input, search_in_month=False)
+        
+        if not search_result['found']:
+            # Không tìm thấy, thử tìm trong tháng này
+            search_result = find_expense_by_name(user_input, search_in_month=True)
+            
+            if not search_result['found']:
+                response = f"❌ Không tìm thấy món nào tên giống '{user_input}' cả.\n\n"
+                response += "💡 Hãy thử:\n"
+                response += "• Gõ tên món chính xác hơn\n"
+                response += "• Kiểm tra lại xem món đã được thêm vào chưa"
+                await update.message.reply_text(response, parse_mode=ParseMode.MARKDOWN)
+                return
+        
+        # Tìm thấy 1 món tương đồng
+        match = search_result['match']
+        row_index = search_result['row_index']
+        
+        # Tạo Inline Keyboard để xác nhận
+        keyboard = [
+            [
+                InlineKeyboardButton("✅ Đúng, xóa đi", callback_data=f"delete_confirm_{row_index}"),
+                InlineKeyboardButton("❌ Không phải", callback_data="delete_cancel")
+            ]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        # Gửi câu hỏi xác nhận
+        response = (
+            f"🔍 **Tìm thấy món tương đồng:**\n\n"
+            f"📝 **{match['item']}**\n"
+            f"💰 {match['amount']:,}đ\n"
+            f"📂 {match['category']}\n"
+            f"📅 {match['date']}\n\n"
+            f"❓ Có phải bạn muốn xóa món này không?"
+        )
+        
+        await update.message.reply_text(response, parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup)
+        logger.info(f"✅ Đã gửi câu hỏi xác nhận cho user (row_index: {row_index})")
+        
+    except Exception as e:
+        logger.error(f"❌ Lỗi khi xử lý lệnh delete: {e}", exc_info=True)
+        error_msg = "❌ Đã xảy ra lỗi khi tìm kiếm giao dịch. Vui lòng thử lại sau."
+        await update.message.reply_text(error_msg)
+
+
+async def delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Xử lý callback từ Inline Keyboard khi user xác nhận xóa"""
+    query = update.callback_query
+    await query.answer()
+    
+    logger.info(f"📨 Nhận callback delete từ user: {update.effective_user.id}")
+    
+    try:
+        callback_data = query.data
+        
+        if callback_data == "delete_cancel":
+            # User bấm "Không phải"
+            await query.edit_message_text("❌ Đã hủy xóa giao dịch.")
+            logger.info("✅ User đã hủy xóa")
+            return
+        
+        if callback_data.startswith("delete_confirm_"):
+            # User bấm "Đúng, xóa đi"
+            row_index = int(callback_data.split("_")[2])
+            logger.info(f"🗑️ User xác nhận xóa dòng {row_index}")
+            
+            # Xóa giao dịch
+            deleted_info = delete_expense_by_row_index(row_index)
+            
+            # Cập nhật message
+            response = (
+                f"✅ **Đã xóa giao dịch thành công!**\n\n"
+                f"📝 Giao dịch đã xóa:\n"
+                f"• **{deleted_info['item']}**: {deleted_info['amount']:,}đ\n"
+                f"• Phân loại: {deleted_info['category']}\n"
+                f"• Ngày: {deleted_info['date']}"
+            )
+            
+            await query.edit_message_text(response, parse_mode=ParseMode.MARKDOWN)
+            logger.info("✅ Đã xóa giao dịch và cập nhật message")
+            
+    except Exception as e:
+        logger.error(f"❌ Lỗi khi xử lý callback delete: {e}", exc_info=True)
+        error_msg = "❌ Đã xảy ra lỗi khi xóa giao dịch. Vui lòng thử lại sau."
+        try:
+            await query.edit_message_text(error_msg)
+        except:
+            await query.message.reply_text(error_msg)
 
 
 # ==================== BÁO THỨC NHẬP LIỆU ====================
@@ -3295,6 +3412,9 @@ def main():
     application.add_handler(CommandHandler("chart", chart_command))
     application.add_handler(CommandHandler("export", export_command))
     application.add_handler(CommandHandler("undo", undo_command))
+    application.add_handler(CommandHandler("delete", delete_command))
+    application.add_handler(CommandHandler("xoa", delete_command))  # Alias tiếng Việt
+    application.add_handler(CallbackQueryHandler(delete_callback, pattern="^delete_"))
     application.add_handler(CommandHandler("remind", remind_command))
     application.add_handler(CommandHandler("stopremind", stopremind_command))
     application.add_handler(CommandHandler("chia", chia_command))
